@@ -26,9 +26,22 @@ export interface SizedLeg {
   actualShortNotionalUsd?: number;
 }
 
+export interface OrderIdempotencyContext {
+  strategyId: number;
+  cycleId: number;
+  leg: "stock" | "hedge";
+}
+
 export interface ExecutionAdapter {
   mode: "paper" | "live";
-  placeOrder(symbol: string, side: "BUY" | "SELL", leg: SizedLeg, referencePrice: number): Promise<Fill>;
+  /**
+   * `idempotencyContext` is optional for the paper adapter (which needs no
+   * stable id) but is REQUIRED in practice for the live adapter — it
+   * derives the stable clientOrderId a real order must carry so a retry
+   * after an ambiguous outcome can never double-submit. See
+   * `liveExecution.ts`.
+   */
+  placeOrder(symbol: string, side: "BUY" | "SELL", leg: SizedLeg, referencePrice: number, idempotencyContext?: OrderIdempotencyContext): Promise<Fill>;
 }
 
 /**
@@ -114,24 +127,23 @@ export class PaperExecutionAdapter implements ExecutionAdapter {
 }
 
 /**
- * Live adapter is intentionally unimplemented in this build. Placing real
- * orders requires the user's own authorized Binance API credentials with
- * trade scope, which this agent will not create or request on its own.
- * Wiring this up is a deliberate, explicit step, not a silent fallback.
+ * Constructs the real live adapter ONLY after every gate in
+ * `liveExecution.ts#assertLiveTradingGate` passes: HEDGEOS_MODE=live,
+ * HEDGEOS_LIVE_TRADING_CONFIRMED='I_UNDERSTAND_THE_RISK',
+ * HEDGEOS_LIVE_CHECKLIST_COMPLETE='yes', and real BINANCE_API_KEY/SECRET.
+ * None of these are set anywhere in this repository, its defaults, or its
+ * deployment scripts — this remains structurally inert until a human sets
+ * all four, deliberately, outside of any code this project ships. The
+ * import itself is inert: `liveExecution.ts`/`liveHttp.ts` define request
+ * builders and a fetch wrapper, nothing runs at module load time.
  */
-export class LiveExecutionAdapter implements ExecutionAdapter {
-  mode: "paper" | "live" = "live";
-
-  async placeOrder(): Promise<Fill> {
-    throw new Error(
-      "Live execution is not wired up. Set HEDGEOS_MODE=paper, or implement authenticated order placement " +
-        "against BINANCE_API_KEY/BINANCE_API_SECRET once you have created and authorized those credentials yourself.",
-    );
-  }
-}
-
-export function getExecutionAdapter(): ExecutionAdapter {
+export async function getExecutionAdapter(): Promise<ExecutionAdapter> {
   const mode = (process.env.HEDGEOS_MODE ?? "paper").toLowerCase();
-  if (mode === "live") return new LiveExecutionAdapter();
+  if (mode === "live") {
+    const { assertLiveTradingGate, LiveExecutionAdapter } = await import("./liveExecution.js");
+    const creds = assertLiveTradingGate();
+    const hedgeLeverage = Number(process.env.HEDGEOS_LIVE_HEDGE_LEVERAGE ?? "2");
+    return new LiveExecutionAdapter(creds, hedgeLeverage);
+  }
   return new PaperExecutionAdapter();
 }

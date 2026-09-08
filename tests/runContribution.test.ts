@@ -167,6 +167,167 @@ describe("runContribution — partial fills and rejections (Priority 3 realism)"
   });
 });
 
+describe("runContribution — live mode: hedge sizing tracks the STOCK LEG'S ACTUAL fill, not the pre-trade target", () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = freshDb();
+    vi.mocked(discoverPair).mockResolvedValue(SUPPORTED_DISCOVERY as never);
+  });
+  afterEach(() => db.close());
+
+  it("re-derives the hedge budget from stockFill.notionalUsd (90/10 ratio applied to REALIZED dollars) before sizing the hedge leg", async () => {
+    const strategy = createStrategy(db, {
+      ticker: "NVDA",
+      spotSymbol: "NVDABUSDT",
+      futuresSymbol: "NVDAUSDT",
+      contributionUsd: 100,
+      frequency: "weekly",
+      hedgeLeverage: 2,
+    });
+
+    // Pre-trade target would be: stock budget $90 @ 233 -> ~0.386 qty -> ~$89.94
+    // notional; hedge budget would nominally be $10. Simulate a stock fill
+    // that came back notably LOWER than the pre-trade target (adverse
+    // slippage/partial liquidity) — the hedge must track that real $80, not
+    // the originally-budgeted $90.
+    const placeOrder = vi.fn(async (symbol: string, side: "BUY" | "SELL", _leg: unknown, _refPrice: number, _ctx?: unknown) => {
+      if (symbol === "NVDABUSDT") {
+        return { symbol, side, quantity: 0.343, price: 233.24, notionalUsd: 80.0, mode: "live", orderId: "1", status: "filled" };
+      }
+      return { symbol, side, quantity: 0.03, price: 233.2, notionalUsd: 6.9, mode: "live", orderId: "2", status: "filled" };
+    });
+
+    const receipt = await runContribution(db, strategy, { mode: "live", placeOrder } as never, 1);
+
+    expect(receipt.status).toBe("completed");
+    // hedge budget actually used for sizing should be 80 * (0.1/0.9) = 8.888... -> $8.89, not the nominal $10
+    const hedgeCall = placeOrder.mock.calls.find((c) => c[0] === "NVDAUSDT")!;
+    const hedgeLegArg = hedgeCall[2] as { quantity: number };
+    // at price 233.2, stepSize 0.01: target notional = 8.89 * 2 = 17.78 -> floor to 0.07 qty (0.07*233.2=16.32) — recompute expected via same math the engine uses
+    expect(hedgeLegArg.quantity).toBeGreaterThan(0);
+    expect(hedgeLegArg.quantity).toBeLessThan(0.09); // less than the nominal-budget sizing (~0.08-0.09) would have produced
+    expect(receipt.hedge!.budgetUsd).toBeCloseTo(8.89, 2);
+  });
+
+  it("passes a stable idempotency context (strategyId, cycleId, leg) derived from the cycleId argument", async () => {
+    const strategy = createStrategy(db, {
+      ticker: "NVDA",
+      spotSymbol: "NVDABUSDT",
+      futuresSymbol: "NVDAUSDT",
+      contributionUsd: 100,
+      frequency: "weekly",
+      hedgeLeverage: 2,
+    });
+    const placeOrder = vi.fn(async (symbol: string, side: "BUY" | "SELL", _leg: unknown, _refPrice: number, _ctx?: unknown) => ({
+      symbol,
+      side,
+      quantity: symbol === "NVDABUSDT" ? 0.38 : 0.06,
+      price: symbol === "NVDABUSDT" ? 233 : 233.2,
+      notionalUsd: symbol === "NVDABUSDT" ? 88.5 : 14,
+      mode: "live",
+      orderId: "x",
+      status: "filled",
+    }));
+
+    await runContribution(db, strategy, { mode: "live", placeOrder } as never, 42);
+
+    const stockCall = placeOrder.mock.calls.find((c) => c[0] === "NVDABUSDT")!;
+    expect(stockCall[4]).toEqual({ strategyId: strategy.id, cycleId: 42, leg: "stock" });
+    const hedgeCall = placeOrder.mock.calls.find((c) => c[0] === "NVDAUSDT")!;
+    expect(hedgeCall[4]).toEqual({ strategyId: strategy.id, cycleId: 42, leg: "hedge" });
+  });
+
+  it("paper mode is unaffected: hedge sizing still uses the nominal contribution split, not the stock fill", async () => {
+    const strategy = createStrategy(db, {
+      ticker: "NVDA",
+      spotSymbol: "NVDABUSDT",
+      futuresSymbol: "NVDAUSDT",
+      contributionUsd: 100,
+      frequency: "weekly",
+      hedgeLeverage: 2,
+    });
+    const receipt = await runContribution(db, strategy, new PaperExecutionAdapter());
+    // Nominal hedge budget for a $100 contribution is $10, regardless of the (near-exact, paper) stock fill.
+    expect(receipt.hedge!.budgetUsd).toBe(10);
+  });
+});
+
+describe("runContribution — CRITICAL: a THROWN hedge-leg error must never lose the stock leg's real fill", () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = freshDb();
+    vi.mocked(discoverPair).mockResolvedValue(SUPPORTED_DISCOVERY as never);
+  });
+  afterEach(() => db.close());
+
+  it("regression: previously, a throw from the hedge leg propagated out of runContribution before any DB write — the stock fill vanished entirely", async () => {
+    const strategy = createStrategy(db, {
+      ticker: "NVDA",
+      spotSymbol: "NVDABUSDT",
+      futuresSymbol: "NVDAUSDT",
+      contributionUsd: 100,
+      frequency: "weekly",
+      hedgeLeverage: 2,
+    });
+
+    const placeOrder = vi.fn(async (symbol: string) => {
+      if (symbol === "NVDABUSDT") {
+        return { symbol, side: "BUY", quantity: 0.386, price: 233, notionalUsd: 89.94, mode: "live", orderId: "real-order-1", status: "filled" };
+      }
+      // Simulates a real exception path: insufficient margin, a permission
+      // failure, or a genuinely unresolved ambiguous-outcome error from
+      // LiveExecutionAdapter — anything that THROWS rather than resolving.
+      throw new Error("Margin is insufficient.");
+    });
+
+    // Must not throw out of runContribution — the wrapper converts the
+    // hedge leg's throw into a recorded, clearly-labeled unresolved outcome.
+    const receipt = await runContribution(db, strategy, { mode: "live", placeOrder } as never, 7);
+
+    expect(receipt.status).toBe("partial_failure");
+
+    // The critical assertion: the stock leg's REAL fill is actually persisted.
+    expect(receipt.stock!.orderStatus).toBe("filled");
+    expect(receipt.stock!.filledQty).toBeCloseTo(0.386, 6);
+    const execRow = db.prepare("SELECT * FROM executions WHERE id = ?").get(receipt.executionId) as any;
+    expect(execRow).toBeDefined();
+    expect(execRow.stock_filled_qty).toBeCloseTo(0.386, 6);
+    const receiptRows = db.prepare("SELECT * FROM receipts WHERE execution_id = ?").all(receipt.executionId) as any[];
+    const stockReceipt = receiptRows.find((r) => r.leg === "stock");
+    expect(stockReceipt).toBeDefined();
+    expect(stockReceipt.order_id).toBe("real-order-1");
+
+    // The hedge leg's outcome is recorded as unresolved/rejected, never silently dropped, and never mislabeled as a confirmed rejection.
+    expect(receipt.hedge!.orderStatus).toBe("rejected");
+    expect(receipt.hedge!.reason).toMatch(/UNRESOLVED/);
+    expect(receipt.hedge!.reason).toMatch(/Margin is insufficient/);
+
+    // paperState (used identically for live receipts) still reflects the real stock fill.
+    expect(receipt.paperState!.cumulativeStockQty).toBeCloseTo(0.386, 6);
+  });
+
+  it("a throw from the STOCK leg itself is also captured, not just the hedge leg", async () => {
+    const strategy = createStrategy(db, {
+      ticker: "NVDA",
+      spotSymbol: "NVDABUSDT",
+      futuresSymbol: "NVDAUSDT",
+      contributionUsd: 100,
+      frequency: "weekly",
+      hedgeLeverage: 2,
+    });
+    const placeOrder = vi.fn(async () => {
+      throw new Error("Invalid API-key, IP, or permissions for action.");
+    });
+
+    const receipt = await runContribution(db, strategy, { mode: "live", placeOrder } as never, 8);
+    expect(receipt.status).toBe("partial_failure");
+    expect(receipt.stock!.orderStatus).toBe("rejected");
+    expect(receipt.stock!.reason).toMatch(/UNRESOLVED/);
+  });
+});
+
 describe("runContribution — unsupported pair", () => {
   let db: Database.Database;
 

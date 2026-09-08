@@ -8,7 +8,6 @@ import {
   listReceipts,
 } from "../db/index.js";
 import { evaluateRiskAlerts, type LatestExecutionSummary } from "../risk/checks.js";
-import { getExecutionAdapter } from "../binance/execution.js";
 
 /**
  * Minimal, read-only dashboard. Built last, per plan, after the autonomous
@@ -22,7 +21,11 @@ import { getExecutionAdapter } from "../binance/execution.js";
 const db = openDb();
 const app = express();
 const port = Number(process.env.HEDGEOS_DASHBOARD_PORT ?? 8766);
-const adapterMode = getExecutionAdapter().mode;
+// Reads the mode label directly from the env var rather than constructing a
+// real ExecutionAdapter — the dashboard is read-only and must never trigger
+// the live-trading gate (which requires real credentials) just to render a
+// "PAPER MODE" banner.
+const adapterMode = (process.env.HEDGEOS_MODE ?? "paper").toLowerCase() === "live" ? "live" : "paper";
 
 function esc(s: unknown): string {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);

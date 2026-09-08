@@ -17,8 +17,10 @@ import {
 import { ALLOWED_HEDGE_LEVERAGES, DEFAULT_HEDGE_LEVERAGE } from "../engine/types.js";
 import { evaluateRiskAlerts, type LatestExecutionSummary } from "../risk/checks.js";
 import { previewContribution } from "../worker/preview.js";
+import { ExternalObservationSchema, validateExternalObservation } from "../observations/externalObservation.js";
 import { ensureDueCycles, getPendingAndRetryableCycles, claimCycle, processCycle } from "../scheduler/cycles.js";
 import { getExecutionAdapter } from "../binance/execution.js";
+import { evaluateFundingReadiness } from "../binance/fundingReadiness.js";
 
 /**
  * HedgeOS-owned MCP server: an operator interface onto the SAME persistent
@@ -143,6 +145,95 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "preview_with_agent_os_observations",
+  {
+    title: "Preview a strategy, cross-checked against operator-supplied Agent OS observations",
+    description:
+      "Same dry-run discovery + deterministic sizing as preview_strategy (writes nothing, places no order), PLUS a validation report for zero or more market observations the operator obtained separately (in practice: real read-only calls to Binance's own Agent OS MCP server, made interactively by the operator's own session — this server never calls it, since it has no headless/unattended auth path). Each observation is cross-checked against HedgeOS's OWN independently-fetched live discovery for symbol identity, freshness (<=120s), and price deviation (<=2%). This is a corroboration/evidence report only: the sizing result never reads price off an external observation, accepted or not — sizing is always computed from HedgeOS's own live discoverPair() call, so no externally-supplied or LLM-stated price can influence money math.",
+    inputSchema: {
+      ticker: z.string().min(1),
+      contributionUsd: z.number().positive(),
+      hedgeLeverage: z.number().refine((n) => (ALLOWED_HEDGE_LEVERAGES as readonly number[]).includes(n), {
+        message: `hedgeLeverage must be one of ${ALLOWED_HEDGE_LEVERAGES.join(", ")}`,
+      }).default(DEFAULT_HEDGE_LEVERAGE),
+      externalObservations: z.array(ExternalObservationSchema).default([]),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ ticker, contributionUsd, hedgeLeverage, externalObservations }) => {
+    try {
+      const preview = await previewContribution(ticker, contributionUsd, hedgeLeverage);
+      const discovery = preview.discovery;
+      const observationVerdicts = externalObservations.map((obs) => validateExternalObservation(obs, discovery));
+      return textResult({
+        ...preview,
+        agentOsObservations: observationVerdicts,
+        note:
+          "sizing is computed exclusively from HedgeOS's own live discoverPair() result (see discovery.spot.price / discovery.futures.markPrice) — agentOsObservations is a source-attributed corroboration report and never feeds the sizing engine, accepted or rejected.",
+      });
+    } catch (err) {
+      return errorResult((err as Error).message);
+    }
+  },
+);
+
+server.registerTool(
+  "check_funding_readiness",
+  {
+    title: "Check funding readiness for a proposed contribution",
+    description:
+      "Compares what a proposed contribution actually requires (via the same deterministic sizing engine every execution path uses) against the operator's OWN real account balances — Spot USDT for the stock leg, Futures USDT margin for the hedge leg — and reports a shortfall, if any. Read-only: makes only GET account-balance calls, places no order, changes no leverage/margin, and is completely independent of HEDGEOS_MODE=live (works, and is meant to be run, long before that gate could ever pass). Requires BINANCE_API_KEY/BINANCE_API_SECRET in THIS server process's environment; without them, returns a clear 'not configured' result with the sizing preview alone.",
+    inputSchema: {
+      ticker: z.string().min(1),
+      contributionUsd: z.number().positive(),
+      hedgeLeverage: z.number().refine((n) => (ALLOWED_HEDGE_LEVERAGES as readonly number[]).includes(n), {
+        message: `hedgeLeverage must be one of ${ALLOWED_HEDGE_LEVERAGES.join(", ")}`,
+      }).default(DEFAULT_HEDGE_LEVERAGE),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ ticker, contributionUsd, hedgeLeverage }) => {
+    try {
+      const preview = await previewContribution(ticker, contributionUsd, hedgeLeverage);
+      if (!preview.sizing) {
+        return textResult({ ticker, contributionUsd, credentialsConfigured: false, funding: undefined, discovery: preview.discovery, note: "instrument pair is not usable — no funding check to run" });
+      }
+
+      const apiKey = process.env.BINANCE_API_KEY;
+      const apiSecret = process.env.BINANCE_API_SECRET;
+      if (!apiKey || !apiSecret) {
+        return textResult({
+          ticker,
+          contributionUsd,
+          credentialsConfigured: false,
+          sizing: preview.sizing,
+          note:
+            "BINANCE_API_KEY/BINANCE_API_SECRET are not set in this MCP server's environment — cannot check real balances. This is independent of live-trading mode; setting these two vars alone does NOT enable live trading (see LIVE_TRADING_READINESS.md). See docs/LIVE_PREFLIGHT_SETUP.md for how to install them securely, in your own terminal, never through chat.",
+        });
+      }
+
+      const { RealLiveHttpClient } = await import("../binance/liveHttp.js");
+      const { buildSpotAccountRequest, buildFuturesAccountV3Request } = await import("../binance/liveRequests.js");
+      const client = new RealLiveHttpClient();
+      const creds = { apiKey, apiSecret };
+
+      const spotAccount = await client.send<{ balances: Array<{ asset: string; free: string }> }>(
+        buildSpotAccountRequest({ ...creds, timestamp: Date.now() }),
+      );
+      const spotAvailableUsd = Number(spotAccount.balances.find((b) => b.asset === "USDT")?.free ?? 0);
+
+      const futuresAccount = await client.send<{ availableBalance?: string }>(buildFuturesAccountV3Request({ ...creds, timestamp: Date.now() }));
+      const futuresAvailableUsd = Number(futuresAccount.availableBalance ?? 0);
+
+      const funding = evaluateFundingReadiness({ ticker: preview.ticker, sizing: preview.sizing, spotAvailableUsd, futuresAvailableUsd });
+      return textResult({ credentialsConfigured: true, sizing: preview.sizing, funding });
+    } catch (err) {
+      return errorResult((err as Error).message);
+    }
+  },
+);
+
 // ---------------------------------------------------------------------------
 // State-changing tools (paper mode only — no live trading is reachable here)
 // ---------------------------------------------------------------------------
@@ -221,7 +312,7 @@ server.registerTool(
     if (!strategy) return errorResult(`no strategy with id ${strategyId}`);
     if (strategy.status !== "active") return errorResult(`strategy ${strategyId} is ${strategy.status}, not active`);
 
-    const adapter = getExecutionAdapter();
+    const adapter = await getExecutionAdapter();
     if (adapter.mode !== "paper") {
       return errorResult("refusing: execution adapter is not in paper mode (HEDGEOS_MODE must be 'paper' for this MCP server)");
     }

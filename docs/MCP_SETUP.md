@@ -29,6 +29,7 @@ export HEDGEOS_MODE=paper
 - `list_receipts` — durable per-leg receipts (requested vs. filled, fees, order status)
 - `list_executions` — one row per attempted contribution cycle
 - `preview_strategy` — dry-run discovery + sizing against live market data; **writes nothing, places no order**
+- `preview_with_agent_os_observations` — same as `preview_strategy`, plus a validation report cross-checking operator-supplied observations (in practice, real reads from Binance's own Agent OS MCP server) against HedgeOS's own live discovery for symbol identity, freshness, and price deviation. The supplied observations are evidence only — sizing always uses HedgeOS's own price. See `docs/AGENT_OS_OPERATOR_WORKFLOW.md`.
 
 **State-changing (all paper-mode only — no tool here can reach live trading):**
 - `create_paper_strategy` — creates a strategy row; does not place an order itself

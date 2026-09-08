@@ -26,19 +26,27 @@ export function buildNewFuturesOrderRequest(args: {
   clientOrderId: string;
   timestamp: number;
   recvWindow?: number;
+  /** BOTH for One-way position mode (the common default), LONG/SHORT required if the account is in Hedge Mode. */
+  positionSide?: "BOTH" | "LONG" | "SHORT";
+  reduceOnly?: boolean;
 }): SignedRequest {
-  const query = signQueryString(
-    {
-      symbol: args.symbol,
-      side: args.side,
-      type: "MARKET",
-      quantity: args.quantity,
-      newClientOrderId: args.clientOrderId,
-      timestamp: args.timestamp,
-      recvWindow: args.recvWindow ?? 5000,
-    },
-    args.apiSecret,
-  );
+  const params: Record<string, string | number | boolean> = {
+    symbol: args.symbol,
+    side: args.side,
+    type: "MARKET",
+    quantity: args.quantity,
+    newClientOrderId: args.clientOrderId,
+    // RESULT (not the default ACK) returns executedQty/status/avgPrice directly in
+    // the response — verified via official docs (New Order, USDⓈ-M Futures REST API).
+    // Reconciliation still independently re-derives fill state from userTrades
+    // (see reconcileOrder) regardless of what this response says.
+    newOrderRespType: "RESULT",
+    timestamp: args.timestamp,
+    recvWindow: args.recvWindow ?? 5000,
+  };
+  if (args.positionSide) params.positionSide = args.positionSide;
+  if (args.reduceOnly !== undefined) params.reduceOnly = args.reduceOnly;
+  const query = signQueryString(params, args.apiSecret);
   return { method: "POST", url: `${FUTURES_BASE}/fapi/v1/order?${query}`, headers: authHeaders(args.apiKey) };
 }
 
@@ -59,12 +67,82 @@ export function buildNewSpotOrderRequest(args: {
       type: "MARKET",
       quantity: args.quantity,
       newClientOrderId: args.clientOrderId,
+      newOrderRespType: "RESULT",
       timestamp: args.timestamp,
       recvWindow: args.recvWindow ?? 5000,
     },
     args.apiSecret,
   );
   return { method: "POST", url: `${SPOT_BASE}/api/v3/order?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+export function buildQuerySpotOrderRequest(args: {
+  apiKey: string;
+  apiSecret: string;
+  symbol: string;
+  origClientOrderId: string;
+  timestamp: number;
+}): SignedRequest {
+  const query = signQueryString(
+    { symbol: args.symbol, origClientOrderId: args.origClientOrderId, timestamp: args.timestamp },
+    args.apiSecret,
+  );
+  return { method: "GET", url: `${SPOT_BASE}/api/v3/order?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+export function buildSpotMyTradesRequest(args: {
+  apiKey: string;
+  apiSecret: string;
+  symbol: string;
+  orderId: number;
+  timestamp: number;
+}): SignedRequest {
+  const query = signQueryString({ symbol: args.symbol, orderId: args.orderId, timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${SPOT_BASE}/api/v3/myTrades?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+export function buildSpotAccountRequest(args: { apiKey: string; apiSecret: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${SPOT_BASE}/api/v3/account?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+/** GET /sapi/v1/account/apiRestrictions — this credential's own permission flags (enableFutures, enableSpotAndMarginTrading, ipRestrict, etc). Verified via official docs 2026-09-08. */
+export function buildApiRestrictionsRequest(args: { apiKey: string; apiSecret: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${SPOT_BASE}/sapi/v1/account/apiRestrictions?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+/** GET /sapi/v1/account/status — coarse account status (e.g. "Normal"). */
+export function buildAccountStatusRequest(args: { apiKey: string; apiSecret: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${SPOT_BASE}/sapi/v1/account/status?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+/** GET /sapi/v1/account/info — isMarginEnabled/isFutureEnabled/isOptionsEnabled flags for this account. */
+export function buildAccountInfoRequest(args: { apiKey: string; apiSecret: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${SPOT_BASE}/sapi/v1/account/info?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+export function buildFuturesAccountV3Request(args: { apiKey: string; apiSecret: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${FUTURES_BASE}/fapi/v3/account?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+export function buildFuturesOpenOrdersRequest(args: { apiKey: string; apiSecret: string; symbol: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ symbol: args.symbol, timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${FUTURES_BASE}/fapi/v1/openOrders?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+export function buildSpotOpenOrdersRequest(args: { apiKey: string; apiSecret: string; symbol: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ symbol: args.symbol, timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${SPOT_BASE}/api/v3/openOrders?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+/** Reads current position mode (One-way vs Hedge) — required to know whether `positionSide` must be sent on new orders. */
+export function buildGetPositionSideDualRequest(args: { apiKey: string; apiSecret: string; timestamp: number }): SignedRequest {
+  const query = signQueryString({ timestamp: args.timestamp }, args.apiSecret);
+  return { method: "GET", url: `${FUTURES_BASE}/fapi/v1/positionSide/dual?${query}`, headers: authHeaders(args.apiKey) };
 }
 
 export function buildQueryFuturesOrderRequest(args: {

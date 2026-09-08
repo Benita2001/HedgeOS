@@ -19,22 +19,17 @@ function log(msg: string) {
  * HedgeOS an agent rather than a script — it keeps running and making
  * scheduling/state decisions without an open Claude Code or chat session.
  *
- * Milestone 2 scope: local, paper-mode only. This is NOT a claim of
- * production readiness — no process supervisor, no live trading, no
- * authenticated order reconciliation against a real exchange are wired up.
+ * Live execution (Checkpoint 9): the worker CAN start with HEDGEOS_MODE=live,
+ * but only if `assertLiveTradingGate` (liveExecution.ts) passes — real
+ * BINANCE_API_KEY/SECRET plus two explicit confirmation env vars
+ * (HEDGEOS_LIVE_TRADING_CONFIRMED, HEDGEOS_LIVE_CHECKLIST_COMPLETE). None of
+ * those are set in this project's environment or deployment as shipped, so
+ * this remains paper-only in practice until a human deliberately sets all
+ * four outside of any code here. See LIVE_TRADING_READINESS.md.
  */
 export async function startWorker() {
-  const mode = (process.env.HEDGEOS_MODE ?? "paper").toLowerCase();
-  if (mode === "live") {
-    throw new Error(
-      "HedgeOS worker refuses to start with HEDGEOS_MODE=live in Milestone 2. " +
-        "Live execution is explicitly out of scope until authenticated trading, exact-decimal " +
-        "arithmetic proof, and exchange-order reconciliation are built and reviewed.",
-    );
-  }
-
   const db = openDb();
-  const adapter = getExecutionAdapter();
+  const adapter = await getExecutionAdapter();
   const tickMs = Number(process.env.HEDGEOS_TICK_MS ?? 5000);
 
   log(`HedgeOS worker starting. mode=${adapter.mode} tickMs=${tickMs}`);

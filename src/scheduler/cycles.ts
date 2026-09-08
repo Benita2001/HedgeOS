@@ -111,7 +111,7 @@ export async function processCycle(
   adapter: ExecutionAdapter,
 ): Promise<StructuredReceipt> {
   try {
-    const receipt = await runContribution(db, strategy, adapter);
+    const receipt = await runContribution(db, strategy, adapter, cycle.id);
 
     if (receipt.status === "completed") {
       db.prepare(

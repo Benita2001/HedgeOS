@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { discoverPair } from "../binance/client.js";
-import type { ExecutionAdapter, Fill } from "../binance/execution.js";
-import { sizeDcaHedgeContribution } from "../engine/sizing.js";
+import type { ExecutionAdapter, Fill, SizedLeg } from "../binance/execution.js";
+import { sizeDcaHedgeContribution, sizeHedgeLeg } from "../engine/sizing.js";
 import { assertValidHedgeLeverage } from "../engine/types.js";
 import { getPaperState, type StrategyRow } from "../db/index.js";
 
@@ -73,10 +73,65 @@ export interface StructuredReceipt {
  * accounting only applies to legs that were never executable in the first
  * place (below exchange minimums), never to a rejected order.
  */
+/**
+ * CRITICAL SAFETY WRAPPER — do not remove. `adapter.placeOrder` can THROW
+ * (not just resolve with a status:"rejected" Fill) — e.g. an insufficient-
+ * margin error, a permission failure, or a genuinely unresolved
+ * ambiguous-outcome error from `LiveExecutionAdapter` (see
+ * `liveExecution.ts`). Before this wrapper existed, a throw from the HEDGE
+ * leg propagated straight out of `runContribution` and skipped the
+ * `INSERT INTO executions`/`receipts` calls entirely — meaning a STOCK leg
+ * that had genuinely, exchange-confirmed FILLED would never be recorded
+ * anywhere in HedgeOS: no execution row, no receipt, invisible to
+ * get_strategy_status/list_receipts/the dashboard, with a real position
+ * sitting on the exchange. This wrapper ensures every call site always
+ * gets back a Fill-shaped result — a thrown error becomes a synthetic
+ * "rejected" Fill whose `reason` is explicitly prefixed UNRESOLVED (never
+ * conflated with a confirmed exchange rejection), so the existing
+ * partial_failure / never-auto-retry / manual-review path in this function
+ * and in `scheduler/cycles.ts` still engages correctly, and nothing is
+ * silently lost.
+ */
+async function placeOrderCapturingThrow(
+  adapter: ExecutionAdapter,
+  symbol: string,
+  side: "BUY" | "SELL",
+  leg: SizedLeg,
+  referencePrice: number,
+  idempotencyContext: { strategyId: number; cycleId: number; leg: "stock" | "hedge" } | undefined,
+): Promise<Fill> {
+  try {
+    return await adapter.placeOrder(symbol, side, leg, referencePrice, idempotencyContext);
+  } catch (err) {
+    return {
+      symbol,
+      side,
+      quantity: 0,
+      price: 0,
+      notionalUsd: 0,
+      mode: adapter.mode,
+      orderId: "unresolved",
+      status: "rejected",
+      reason:
+        `UNRESOLVED — order placement threw and did NOT return a confirmed exchange response. This is NOT a confirmed rejection: ` +
+        `the order may have partially or fully filled on the exchange despite this error. Do not assume zero exposure — manually verify ` +
+        `actual exchange state (GET positionRisk / openOrders / userTrades for ${symbol}) before taking any further action on this strategy. ` +
+        `Original error: ${(err as Error).message}`,
+    };
+  }
+}
+
 export async function runContribution(
   db: Database.Database,
   strategy: StrategyRow,
   adapter: ExecutionAdapter,
+  /**
+   * The due-cycle row id this contribution is running for. Required to
+   * derive a stable per-leg clientOrderId for the live adapter (see
+   * `liveExecution.ts`) — the paper adapter ignores it. Omitted only by
+   * manual/preview call sites that never reach a live adapter.
+   */
+  cycleId?: number,
 ): Promise<StructuredReceipt> {
   assertValidHedgeLeverage(strategy.hedge_leverage);
 
@@ -120,20 +175,51 @@ export async function runContribution(
 
   const { spot, futures } = discovery;
   const referencePrice = spot.price!;
+  const policy = { stockFraction: 0.9, hedgeFraction: 0.1, hedgeLeverage: strategy.hedge_leverage };
 
-  const sizing = sizeDcaHedgeContribution(strategy.contribution_usd, referencePrice, spot.filters!, futures.filters!, {
-    stockFraction: 0.9,
-    hedgeFraction: 0.1,
-    hedgeLeverage: strategy.hedge_leverage,
-  });
+  const sizing = sizeDcaHedgeContribution(strategy.contribution_usd, referencePrice, spot.filters!, futures.filters!, policy);
 
   let stockFill: Fill | undefined;
   if (sizing.stock.executable) {
-    stockFill = await adapter.placeOrder(discovery.spotSymbol, "BUY", sizing.stock, spot.price!);
+    stockFill = await placeOrderCapturingThrow(
+      adapter,
+      discovery.spotSymbol,
+      "BUY",
+      sizing.stock,
+      spot.price!,
+      cycleId !== undefined ? { strategyId: strategy.id, cycleId, leg: "stock" } : undefined,
+    );
   }
+
+  // Stock leg always runs first, so a stock-side rejection is known before
+  // any futures-side state (leverage/margin config, an open order) is
+  // touched — the safer default sequencing.
+  //
+  // Live mode only: re-derive the hedge budget from the STOCK LEG'S ACTUAL
+  // FILLED NOTIONAL (not the pre-trade budgeted target), preserving the same
+  // 90/10 ratio applied to real, realized dollars — a market order can fill
+  // at a slightly different notional than budgeted, and the hedge should
+  // track the exposure that actually exists, not the exposure that was
+  // planned. Paper mode is deliberately left untouched (still sizes the
+  // hedge from the nominal contribution split) so none of the 56 existing
+  // paper-mode tests or demo behavior change.
+  let hedgeSizing = sizing.hedge;
+  if (adapter.mode === "live" && stockFill && stockFill.status !== "rejected" && stockFill.notionalUsd > 0) {
+    const actualHedgeBudgetUsd = Math.round(stockFill.notionalUsd * (policy.hedgeFraction / policy.stockFraction) * 100) / 100;
+    hedgeSizing = sizeHedgeLeg(actualHedgeBudgetUsd, policy.hedgeLeverage, futures.markPrice!, futures.filters!);
+  }
+  sizing.hedge = hedgeSizing;
+
   let hedgeFill: Fill | undefined;
   if (sizing.hedge.executable) {
-    hedgeFill = await adapter.placeOrder(discovery.futuresSymbol, "SELL", sizing.hedge, futures.markPrice!);
+    hedgeFill = await placeOrderCapturingThrow(
+      adapter,
+      discovery.futuresSymbol,
+      "SELL",
+      sizing.hedge,
+      futures.markPrice!,
+      cycleId !== undefined ? { strategyId: strategy.id, cycleId, leg: "hedge" } : undefined,
+    );
   }
 
   const stockOrderStatus = stockFill?.status ?? "not_submitted";
