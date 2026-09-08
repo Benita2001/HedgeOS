@@ -7,3 +7,4 @@ dist/
 data/*.db
 data/*.db-journal
 bitsentry_audit.db
+.claude/

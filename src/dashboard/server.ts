@@ -122,10 +122,17 @@ app.get("/strategy/:id", (req, res) => {
   );
 });
 
+// Binds to loopback only by default — this is a security boundary, not a
+// convenience default. There is no authentication in front of this
+// dashboard, so it must never be reachable except via localhost or an SSH
+// tunnel unless a reverse proxy with real auth is deliberately added later.
+// Override only if you have separately verified a firewall/auth boundary.
+const bindHost = process.env.HEDGEOS_DASHBOARD_HOST ?? "127.0.0.1";
+
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  app.listen(port, () => {
-    console.log(`[HedgeOS dashboard] http://localhost:${port} (PAPER MODE, adapter=${adapterMode})`);
+  app.listen(port, bindHost, () => {
+    console.log(`[HedgeOS dashboard] http://${bindHost}:${port} (PAPER MODE, adapter=${adapterMode})`);
   });
 }
 

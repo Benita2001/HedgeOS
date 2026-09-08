@@ -1,0 +1,9 @@
+[Unit]
+Description=HedgeOS SQLite backup snapshot (one-shot, triggered by hedgeos-backup.timer)
+
+[Service]
+Type=oneshot
+User=hedgeos
+Group=hedgeos
+ExecStart=/opt/hedgeos/app/deploy/backup.sh
+NoNewPrivileges=true

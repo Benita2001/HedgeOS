@@ -1,0 +1,37 @@
+[Unit]
+Description=HedgeOS persistent paper-mode DCA+hedge worker
+After=network-online.target
+Wants=network-online.target
+# Intentionally has no ordering/conflict relationship with hermes-gateway or
+# any other existing service on this host — it must never stop, start, or
+# depend on them.
+
+[Service]
+Type=simple
+User=hedgeos
+Group=hedgeos
+WorkingDirectory=/opt/hedgeos/app
+Environment=PATH=/opt/hedgeos/node/bin:/usr/bin:/bin
+EnvironmentFile=/opt/hedgeos/app/.env
+ExecStart=/opt/hedgeos/node/bin/npx tsx src/worker/index.ts
+Restart=always
+RestartSec=5
+# Idempotency is enforced in application logic (DB-level compare-and-swap
+# claim on due cycles), not by this unit — a restart here can never cause a
+# duplicate contribution, verified in tests/scheduler.test.ts and the live
+# restart demonstration in PROGRESS_LOG.md.
+
+# Defense in depth: this process has no legitimate reason to write outside
+# its own data directory, open listening sockets, or gain new privileges.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/hedgeos/app/data
+ProtectHome=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hedgeos-worker
+
+[Install]
+WantedBy=multi-user.target

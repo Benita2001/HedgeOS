@@ -51,6 +51,25 @@ Session: overnight autonomous continuation, user asleep, authorized to inspect/i
 
 This is the reproducible demo path from the standing instructions, run for real, not asserted from memory.
 
+## Checkpoint 7 — VPS deployment and remote operation
+- **Repository re-verified before trusting the prior report**: 56/56 tests, 8 commits, clean status — confirmed by actually running the commands, not by trusting the report.
+- Read-only inspection of the target VPS (root@173.212.234.24, Ubuntu 24.04, 4 vCPU, 7.8GB RAM, 89GB disk) before any change: found Hermes runs as a **root user-level systemd unit** (`hermes-gateway.service`, invisible to system-level `systemctl`), `/opt/firecrawl` as a separate existing project, `ufw` **inactive** (no OS firewall at all), and only port 22 listening.
+- **Real bug caught during deployment, not assumed away**: `/usr/local/bin/node`/`npx` turned out to be symlinks into Hermes' own private Node install under `/root/.hermes/` — unreadable to an unprivileged user. Rather than touch `/root` permissions or Hermes' install, gave HedgeOS its own fully independent Node v24.20.0 under `/opt/hedgeos/node`, verified the dedicated `hedgeos` system user can execute it, and pointed the systemd units at it explicitly (`Environment=PATH=/opt/hedgeos/node/bin:...`).
+- Fixed the dashboard's `app.listen(port)` to bind explicitly to `127.0.0.1` by default (`src/dashboard/server.ts`) — it previously defaulted to all interfaces, which on a host with no firewall would have been immediately publicly reachable. Verified with `ss -tlnp` on the VPS after deploy: bound to `127.0.0.1:8766` only.
+- Deployed: dedicated unprivileged system user `hedgeos` (no login, no password); `/opt/hedgeos/app` (rsynced from the local machine — no git push, no GitHub involved); `hedgeos-worker.service`, `hedgeos-dashboard.service`, `hedgeos-backup.timer`+`.service` (systemd, `Restart=always`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `enabled` for boot).
+- **Runtime-verified on the actual deployed service**, not assumed from local tests:
+  1. `systemctl status` — both services `active (running)`.
+  2. Created a real NVDA paper strategy via `scripts/seed-strategy.ts` run as the `hedgeos` user.
+  3. Worker's 60s tick picked it up, ran real discovery against live Binance market data, executed: `strategy 1 (NVDA): created 1 due cycle -> claimed -> completed`.
+  4. Inspected the durable receipt directly via `sqlite3`: real 90/10 split, `NVDABUSDT` BUY 0.385 @ $233.39, `NVDAUSDT` SELL 0.08 @ $233.36, $9.34 collateral — matches expected sizing exactly.
+  5. `systemctl restart hedgeos-worker` — confirmed via `journalctl` ("no interrupted cycles found at startup") and a direct `SELECT COUNT(*) FROM executions` (still 1) that restart did **not** duplicate the execution.
+  6. `curl`'d the dashboard on the VPS itself (loopback-only) — rendered the real accumulated position and cycle history.
+  7. **Tested the HedgeOS MCP server exactly as Claude Code would use it**: spawned over SSH from the local Mac (`scripts/mcp-remote-test.ts`), using the same existing SSH key access, no new port or credential — `list_strategies` and `get_strategy_status` both returned the real deployed state.
+  8. Confirmed both services `active` and `enabled` (start-on-boot) at the end of the session.
+- **Explicitly not claimed**: a full machine reboot was not tested (would disrupt Hermes/firecrawl on a shared host without separate approval) — only `systemctl restart` and process-crash auto-restart (`Restart=always`) were verified. `systemctl is-enabled` confirms the units *would* start on boot, but that specific behavior is unverified.
+- **Binance integration boundary confirmed**: the persistent service (worker, dashboard, MCP server) uses **public REST only** (`src/binance/client.ts`) — not the Binance Agent OS MCP server, which requires interactive browser OAuth and has no headless/service-account authentication route available. This was already true before this session; explicitly re-verified by reading the actual import graph, not assumed.
+- No firewall rule changed, no new port opened beyond the pre-existing SSH, Hermes and firecrawl untouched, no credentials created, no live trading enabled, nothing pushed to GitHub, dashboard not made public.
+
 ## Final state
 - **56/56 tests passing**, typecheck clean.
 - 6 commits, all local (`git log --oneline` in the repo). Nothing pushed.

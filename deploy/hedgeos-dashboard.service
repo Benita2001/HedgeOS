@@ -1,0 +1,28 @@
+[Unit]
+Description=HedgeOS read-only paper-mode dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hedgeos
+Group=hedgeos
+WorkingDirectory=/opt/hedgeos/app
+Environment=PATH=/opt/hedgeos/node/bin:/usr/bin:/bin
+EnvironmentFile=/opt/hedgeos/app/.env
+ExecStart=/opt/hedgeos/node/bin/npx tsx src/dashboard/server.ts
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/hedgeos/app/data
+ProtectHome=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hedgeos-dashboard
+
+[Install]
+WantedBy=multi-user.target
