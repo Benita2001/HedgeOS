@@ -38,6 +38,11 @@ Session: overnight autonomous continuation, user asleep, authorized to inspect/i
 - 12 new tests against fixtures and fake credentials — zero network calls to production endpoints.
 - **Confirmed genuinely unreachable**: grepped `src/worker`, `src/mcp`, `src/scheduler`, `src/binance/execution.ts` for any reference to these modules — none exists. `LiveExecutionAdapter` in `execution.ts` still throws unconditionally; the worker still hard-refuses `HEDGEOS_MODE=live`. This is defense in depth, not just "off by default."
 
+## Checkpoint 6 — Minimal read-only dashboard (Priority 5) — commit pending
+- `src/dashboard/server.ts`: plain Express, server-rendered HTML, no build step. Strategy list, per-strategy accumulated paper position, deterministic risk alerts, and cycle history with per-leg requested-vs-filled detail. Prominent "PAPER MODE" banner on every page, states the active adapter mode explicitly.
+- Read-only: no route mutates anything. Reads the same SQLite DB the worker/MCP server use.
+- **Verified with real `curl` requests against the real database** (not just "it compiles"): `GET /` lists the real strategy from the combined demo below; `GET /strategy/1` shows the real accumulated position (0.386 NVDABUSDT, 0.08 NVDAUSDT, $9.32 collateral), the real risk alert, and the real cycle history row with actual fill prices.
+
 ## Combined end-to-end demonstration (fresh DB, real data, run after all checkpoints above)
 1. `scripts/seed-strategy.ts NVDA 100 2 daily` → strategy #1 created, due immediately.
 2. Persistent worker started → detected the due cycle, ran real discovery (`NVDABUSDT`/`NVDAUSDT` live prices), executed a simulated 90/10 fill, persisted the receipt — all within ~3 seconds, one execution.
@@ -52,7 +57,6 @@ This is the reproducible demo path from the standing instructions, run for real,
 - Nothing deployed. No credentials created. No live orders. No agreements signed. Nothing submitted.
 
 ## Explicitly not done (documented, not silently skipped)
-- **Dashboard (Priority 5)**: not built. Deliberately deprioritized — the standing instructions say to build it only after the autonomous core and operator interface are solid, and by the time both were done and verified, remaining time was better spent on README/submission-readiness than a partial UI. Next milestone if there's time before the deadline.
 - **Live trading**: blocked on human-only prerequisites documented in `LIVE_TRADING_READINESS.md` (bStock/ADGM eligibility, TradFi-Perps agreement, a Futures-enabled credential, and — genuinely unverified — whether the Agentic sub-account itself can hold a Futures position at all). None of these can be resolved without you.
 - **Real-time liquidation/mark-to-market monitoring**: the risk module is honest about not having this; building it needs an ongoing price-feed loop against open positions, which doesn't exist yet.
 - **Migration tooling for the SQLite schema**: schema changes during this session required resetting the local dev DB file (safe — it only ever held disposable paper-mode demo data). A real migration system would be needed before this could hold anything worth preserving across schema changes; not built, since paper-mode demo data has never needed to survive a schema change in practice.

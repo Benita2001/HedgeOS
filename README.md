@@ -14,8 +14,8 @@ Built for the Binance Agent OS Mini Hackathon (Track A).
 - Paper execution with partial-fill/rejection modeling: ✅ built, tested.
 - HedgeOS-owned MCP server for Claude Code to inspect/operate the running service: ✅ built, smoke-tested end-to-end.
 - Disabled live-execution signing/reconciliation primitives: ✅ built, unit-tested, **not wired to any runtime path**.
+- Minimal read-only dashboard: ✅ built, verified against real HTTP requests and the real database.
 - Live trading: ❌ blocked on human-only prerequisites (bStock/ADGM eligibility, TradFi-Perps agreement, Futures-enabled credential) — see `LIVE_TRADING_READINESS.md`.
-- Dashboard: not built yet (deliberately deprioritized behind the autonomous core and operator interface, per plan).
 
 ## Architecture
 
@@ -40,6 +40,7 @@ src/
   risk/         deterministic risk alerts (missing hedge exposure, stale schedule, reconciliation
                 discrepancy, static margin-headroom note) — never triggers automatic rebalancing
   mcp/          HedgeOS's own MCP server — operator interface for Claude Code
+  dashboard/    minimal read-only Express dashboard (strategy, positions, risk alerts, cycle history)
 ```
 
 ## Running it
@@ -69,6 +70,11 @@ claude mcp add hedgeos --transport stdio -- npx tsx src/mcp/server.ts
 **MCP smoke test** (spawns the real server, drives it as a real client, verifies idempotency):
 ```bash
 npx tsx scripts/mcp-smoke-test.ts
+```
+
+**Dashboard** (read-only, labels PAPER MODE prominently):
+```bash
+HEDGEOS_MODE=paper npx tsx src/dashboard/server.ts   # http://localhost:8766
 ```
 
 ## Product policy (frozen — see `PROJECT_PLAN.md`)
