@@ -22,7 +22,8 @@ Built for the Binance Agent OS Mini Hackathon (Track A).
 | Automatic inter-wallet transfer | ❌ **Not built.** Documented requirements for a future version in `docs/FUNDING_READINESS.md`. |
 | Self-hosted install for a second, independent user | ✅ **Deploy tooling is generic** (parameterized by `HEDGEOS_DEPLOY_HOST`, no hardcoded IP/paths — verified by grep this session). `docs/SELF_HOSTED_INSTALL.md`. |
 | Multi-tenant hosting (many users, one shared instance) | ❌ **Not built.** Architecture documented in `docs/MULTI_TENANT_ARCHITECTURE.md` — explicitly a design sketch, not a claim of implementation. |
-| Natural-language strategy proposals, including finite duration ("...for six months") | ✅ **Workflow documented** (`docs/OPERATOR_GUIDE.md`) and **duration enforcement is real and tested**: `strategies.end_at` (optional, migration-tested against a pre-existing database), enforced deterministically by the scheduler (`ensureDueCycles`) — no cycle is ever created past it, missed-cycle catch-up near the boundary is correctly capped, and a schedule ending never touches accumulated positions. The AI extracts intent and computes the concrete end date; only the deterministic engine enforces it — not independent LLM reasoning about trading decisions. |
+| Natural-language strategy proposals: any amount, any cadence ("...every 10 minutes"), finite duration ("...for six months") | ✅ **Workflow documented** (`docs/OPERATOR_GUIDE.md`) and **cadence + duration enforcement are real and tested**: `strategies.interval_minutes` (generic whole-minute cadence, overrides `frequency`, 1-minute documented floor tied to the worker's own tick granularity — not any specific demo value) and `strategies.end_at` (optional end date), both migration-tested against a pre-existing database, both enforced deterministically by the scheduler (`ensureDueCycles`) — no cycle ever created past `end_at`, missed-cycle catch-up correctly capped near any boundary, a schedule ending never touches accumulated positions. The AI extracts intent and computes concrete values; only the deterministic engine enforces them — not independent LLM reasoning about trading decisions. |
+| Full recurring live lifecycle (due cycle → stock order → reconciliation → re-derived hedge sizing → hedge order → reconciliation → receipt → next cycle) | ✅ **Real code, integration-tested** across two consecutive cycles with a live-shaped mock adapter (`tests/liveLifecycle.test.ts`) — proves a mid-lifecycle failure in one cycle doesn't corrupt an earlier cycle's real fill or block future scheduling. Still gated: no real order has ever been placed. |
 
 Full evidence, checkpoint by checkpoint: `PROGRESS_LOG.md`.
 
@@ -77,7 +78,7 @@ src/
 
 ```bash
 npm install
-npm test              # 133 tests
+npm test              # 148 tests
 npx tsc --noEmit       # typecheck
 ```
 

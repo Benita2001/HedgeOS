@@ -1,21 +1,29 @@
 /**
  * Verifies the HedgeOS MCP server as it will actually be used from Claude
- * Code: spawned over SSH on the deployed VPS, stdio transport, using the
- * SAME existing SSH key access already in use throughout this session — no
- * new port, no new credential. Read tools only exercised here (state-
- * changing tools already proven safe in scripts/mcp-smoke-test.ts against
- * the local server; this script's job is to prove the SSH transport path
- * itself works, not to re-run every tool).
+ * Code: spawned over SSH on your deployed VPS, stdio transport, using the
+ * SAME SSH key access you already use to manage that host — no new port,
+ * no new credential. Read tools only exercised here (state-changing tools
+ * already proven safe in scripts/mcp-smoke-test.ts against the local
+ * server; this script's job is to prove the SSH transport path itself
+ * works, not to re-run every tool).
+ *
+ * Usage: HEDGEOS_DEPLOY_HOST=root@<your-host> npx tsx scripts/mcp-remote-test.ts
+ * (same env var deploy/deploy.sh uses — no host is hardcoded here or anywhere in this repo).
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 async function main() {
+  const host = process.env.HEDGEOS_DEPLOY_HOST;
+  if (!host) {
+    console.error("Set HEDGEOS_DEPLOY_HOST (e.g. root@203.0.113.10) — the same env var deploy/deploy.sh uses. Refusing to guess a target.");
+    process.exit(1);
+  }
   const transport = new StdioClientTransport({
     command: "ssh",
     args: [
       "-o", "BatchMode=yes",
-      "root@173.212.234.24",
+      host,
       "su -s /bin/sh hedgeos -c 'export PATH=/opt/hedgeos/node/bin:/usr/bin:/bin; cd /opt/hedgeos/app && HEDGEOS_MODE=paper npx tsx src/mcp/server.ts'",
     ],
   });

@@ -59,7 +59,7 @@ export function ensureDueCycles(db: Database.Database, strategy: StrategyRow, no
     if (info.changes > 0) {
       created.push(Number(info.lastInsertRowid));
     }
-    dueAt = addCadence(dueAt, strategy.frequency);
+    dueAt = addCadence(dueAt, strategy.frequency, strategy.interval_minutes);
     count++;
   }
 

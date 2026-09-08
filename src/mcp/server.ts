@@ -20,6 +20,7 @@ import { evaluateRiskAlerts, type LatestExecutionSummary } from "../risk/checks.
 import { previewContribution } from "../worker/preview.js";
 import { ExternalObservationSchema, validateExternalObservation } from "../observations/externalObservation.js";
 import { ensureDueCycles, getPendingAndRetryableCycles, claimCycle, processCycle } from "../scheduler/cycles.js";
+import { MIN_INTERVAL_MINUTES } from "../scheduler/cadence.js";
 import { getExecutionAdapter } from "../binance/execution.js";
 import { evaluateFundingReadiness } from "../binance/fundingReadiness.js";
 
@@ -249,7 +250,7 @@ server.registerTool(
   {
     title: "Create a paper strategy",
     description:
-      "Creates a new HedgeOS strategy in paper mode: 90% of each contribution buys the bStock, 10% is the hedge collateral budget at the given leverage (2x default, 3x optional, nothing higher). Does not place any order — the first contribution runs on the strategy's own schedule via the persistent worker, or can be triggered manually with trigger_due_cycle. Optional endAt (ISO timestamp): if the user said something like 'for six months', compute the concrete end date yourself (now + 6 months) and pass it here — HedgeOS enforces it deterministically (no new cycle is ever scheduled after it; a cycle due exactly on it still runs) but never guesses a duration from vague language on its own. Omit endAt for a strategy that runs indefinitely (the default, unchanged behavior).",
+      "Creates a new HedgeOS strategy in paper mode: 90% of each contribution buys the bStock, 10% is the hedge collateral budget at the given leverage (2x default, 3x optional, nothing higher). Does not place any order — the first contribution runs on the strategy's own schedule via the persistent worker, or can be triggered manually with trigger_due_cycle. `frequency` is required for backward compatibility, but pass optional `intervalMinutes` (a whole number of minutes, e.g. 10 for 'every 10 minutes') to override it with any generic cadence — the minimum is the worker's own tick granularity (1 minute, not any specific demo value), rejected otherwise with a clear error. Optional endAt (ISO timestamp): if the user said something like 'for six months', compute the concrete end date yourself (now + 6 months) and pass it here — HedgeOS enforces it deterministically (no new cycle is ever scheduled after it; a cycle due exactly on it still runs) but never guesses a duration from vague language on its own. Omit endAt for a strategy that runs indefinitely (the default, unchanged behavior).",
     inputSchema: {
       ticker: z.string().min(1),
       contributionUsd: z.number().positive(),
@@ -258,10 +259,11 @@ server.registerTool(
         message: `hedgeLeverage must be one of ${ALLOWED_HEDGE_LEVERAGES.join(", ")}`,
       }).default(DEFAULT_HEDGE_LEVERAGE),
       endAt: z.string().datetime().optional(),
+      intervalMinutes: z.number().int().min(MIN_INTERVAL_MINUTES).optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   },
-  async ({ ticker, contributionUsd, frequency, hedgeLeverage, endAt }) => {
+  async ({ ticker, contributionUsd, frequency, hedgeLeverage, endAt, intervalMinutes }) => {
     const upper = ticker.toUpperCase();
     try {
       const strategy = createStrategy(db, {
@@ -272,11 +274,13 @@ server.registerTool(
         frequency,
         hedgeLeverage,
         endAt,
+        intervalMinutes,
       });
       return textResult({
         created: strategy,
         note:
           "Paper mode. No order has been placed. The instrument pair will be (re-)validated at each contribution via live discovery." +
+          (intervalMinutes ? ` Cadence: every ${intervalMinutes} minute(s), overriding frequency="${frequency}" for scheduling purposes.` : "") +
           (endAt ? ` Schedule ends ${endAt} (inclusive) — no new contribution will be created after that date; accumulated positions are never auto-liquidated when a schedule ends.` : " Runs indefinitely (no endAt given) — pause it yourself when you're done."),
       });
     } catch (err) {

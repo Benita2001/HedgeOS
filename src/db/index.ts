@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertValidHedgeLeverage, DEFAULT_HEDGE_LEVERAGE } from "../engine/types.js";
+import { assertValidIntervalMinutes } from "../scheduler/cadence.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -22,6 +23,12 @@ function runMigrations(db: Database.Database): void {
     // Nullable, no default beyond NULL — every existing row gets end_at=NULL,
     // which means "runs indefinitely," the exact behavior those rows already had.
     db.exec("ALTER TABLE strategies ADD COLUMN end_at TEXT DEFAULT NULL");
+  }
+  const hasIntervalMinutes = columns.some((c) => c.name === "interval_minutes");
+  if (!hasIntervalMinutes) {
+    // Nullable — every existing row gets interval_minutes=NULL, meaning "use the
+    // daily/weekly/monthly calendar cadence," the exact behavior those rows already had.
+    db.exec("ALTER TABLE strategies ADD COLUMN interval_minutes INTEGER DEFAULT NULL");
   }
 }
 
@@ -48,6 +55,8 @@ export interface StrategyRow {
   deferred_hedge_budget_usd: number;
   /** ISO timestamp or null. Null (the default, and every pre-existing strategy's value) means "runs indefinitely." */
   end_at: string | null;
+  /** Whole minutes or null. Null (the default) means "use the daily/weekly/monthly frequency column." Non-null overrides it — generic cadence, e.g. 10 for "every 10 minutes." */
+  interval_minutes: number | null;
 }
 
 /**
@@ -80,6 +89,8 @@ export function createStrategy(
     firstDueAt?: string;
     /** Optional ISO timestamp. Omitted/undefined = runs indefinitely (unchanged default behavior). The caller (an AI operator interpreting "for six months," or a human) is responsible for turning a duration into a concrete date — HedgeOS itself never guesses a duration from vague language. */
     endAt?: string;
+    /** Optional whole-minute cadence override (e.g. 10 for "every 10 minutes"). Omitted/undefined = use `frequency`'s daily/weekly/monthly calendar cadence (unchanged default behavior). Must be >= MIN_INTERVAL_MINUTES. */
+    intervalMinutes?: number;
   },
 ): StrategyRow {
   const hedgeLeverage = args.hedgeLeverage ?? DEFAULT_HEDGE_LEVERAGE;
@@ -87,10 +98,13 @@ export function createStrategy(
   if (args.endAt !== undefined && Number.isNaN(new Date(args.endAt).getTime())) {
     throw new Error(`endAt "${args.endAt}" is not a valid ISO timestamp`);
   }
+  if (args.intervalMinutes !== undefined) {
+    assertValidIntervalMinutes(args.intervalMinutes);
+  }
 
   const stmt = db.prepare(
-    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at, end_at)
-     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')), @endAt)`,
+    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at, end_at, interval_minutes)
+     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')), @endAt, @intervalMinutes)`,
   );
   const info = stmt.run({
     ticker: args.ticker,
@@ -101,6 +115,7 @@ export function createStrategy(
     hedgeLeverage,
     firstDueAt: args.firstDueAt ?? null,
     endAt: args.endAt ?? null,
+    intervalMinutes: args.intervalMinutes ?? null,
   });
   return db.prepare("SELECT * FROM strategies WHERE id = ?").get(info.lastInsertRowid) as StrategyRow;
 }

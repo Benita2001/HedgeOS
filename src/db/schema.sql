@@ -10,6 +10,13 @@ CREATE TABLE IF NOT EXISTS strategies (
   next_due_at TEXT NOT NULL DEFAULT (datetime('now')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   deferred_hedge_budget_usd REAL NOT NULL DEFAULT 0,
+  -- Optional generic cadence override, in whole minutes (e.g. 10 for "every 10 minutes").
+  -- When set, cadence math (addCadence) uses this instead of the `frequency` column, which
+  -- stays required for backward compatibility / display purposes only in that case. NULL (the
+  -- default, and every pre-existing strategy's value) means "use the daily/weekly/monthly
+  -- calendar cadence" — unchanged behavior. See src/scheduler/cadence.ts for the documented
+  -- minimum (tied to the worker's own tick granularity, not any specific demo number).
+  interval_minutes INTEGER DEFAULT NULL,
   -- Optional ISO timestamp: the scheduler creates no new cycle whose scheduled_for is after this
   -- (a cycle scheduled exactly at end_at is still created — inclusive boundary). NULL (the default,
   -- and the only value every strategy created before this column existed has) means "runs
