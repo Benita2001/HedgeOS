@@ -1,8 +1,45 @@
 # HedgeOS
 
-A persistent, autonomous protected-DCA agent for Binance stock/bStock investments. You say "invest $250 into AAPL every week"; HedgeOS splits each new contribution 90% into the stock and 10% into a hedge collateral budget, sizes both legs against live exchange filters with exact fixed-point arithmetic, and keeps doing this on schedule — as a standing service, not a chat session that stops when you close the laptop.
+**A persistent, autonomous protected-DCA agent for Binance stock/bStock investments.** Say "invest $250 into AAPL every week" through Claude Code or Codex; HedgeOS runs the recurring strategy unattended on its own VPS, forever, independent of your laptop being open.
 
 Built for the Binance Agent OS Mini Hackathon (Track A).
+
+## Problem
+
+Dollar-cost-averaging into a stock exposes you to that stock's full downside with no offset, and doing it "properly" — sizing a hedge correctly against live exchange filters, on a schedule, without babysitting it — isn't something a person or a one-off script does reliably. Most "AI trading agent" demos are a chat session that stops the moment you close the tab; they aren't actually autonomous.
+
+## Solution
+
+Every contribution is deterministically split 90% into the stock (via Binance's tokenized bStock spot market) and 10% into collateral for an exact matching short TradFi perpetual — sized against real, live exchange filters with exact fixed-point arithmetic, never delegated to an LLM. This runs inside a persistent worker process on a VPS, not inside the AI conversation: Claude Code/Codex is the **operator** (propose, confirm, inspect, pause) via HedgeOS's own MCP server; the recurring execution itself keeps going whether or not anyone is watching. Real Binance Agent OS MCP calls provide corroborating market evidence; HedgeOS's own independent discovery is what actually prices every order.
+
+## System architecture
+
+```mermaid
+flowchart TB
+    U["Operator (you)"] -->|"natural-language request"| CC["Claude Code / Codex"]
+    CC -->|"real MCP tool calls"| AOS["Binance Agent OS MCP\n(session-bound, evidence only)"]
+    CC -->|"real MCP tool calls"| HMCP["HedgeOS MCP server\n(src/mcp/server.ts)"]
+
+    HMCP -->|"preview / create / authorize / trigger / pause"| DB[("SQLite\nstrategies · cycles · executions · receipts")]
+    HMCP -.->|"read status/receipts"| DB
+
+    W["Persistent worker\n(src/worker/index.ts, systemd, VPS)"] -->|"tick every 60s"| DB
+    W -->|"observe: live discovery"| REST["Binance public REST\n(api./fapi.binance.com)"]
+    W -->|"decide: 90/10 sizing"| ENGINE["Deterministic engine\n(src/engine — no LLM)"]
+    ENGINE --> W
+
+    W -->|"paper strategies: act"| PAPER["PaperExecutionAdapter\n(simulated fill)"]
+    W -->|"authorized live strategies only,\ngate re-checked every cycle"| LIVE["LiveExecutionAdapter\n(real signed REST, gated)"]
+    LIVE -->|"order + funding transfer"| BINANCE["Binance Spot + USDⓈ-M Futures\n(real account)"]
+    BINANCE -->|"reconciliation"| LIVE
+
+    PAPER -->|"verify: durable receipt"| DB
+    LIVE -->|"verify: durable receipt"| DB
+
+    DASH["Read-only dashboard\n(127.0.0.1 only)"] -->|"read"| DB
+```
+
+Every node above is a real, verified component (`src/mcp/server.ts`, `src/worker/index.ts`, `src/engine/`, `src/binance/execution.ts`/`liveExecution.ts`, the SQLite file, the Express dashboard) — none of this is planned or aspirational. The critical path a judge should trace: **operator request → HedgeOS MCP → persistent worker (independent of the chat session) → deterministic engine → Binance REST → durable receipt**, with Agent OS as a corroborating evidence layer feeding into HedgeOS's own MCP tools, never into the engine directly.
 
 ## Status — read this before anything else below
 
