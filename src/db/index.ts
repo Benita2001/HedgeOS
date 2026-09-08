@@ -64,6 +64,23 @@ export function listActiveStrategies(db: Database.Database): StrategyRow[] {
   return db.prepare("SELECT * FROM strategies WHERE status = 'active' ORDER BY id").all() as StrategyRow[];
 }
 
+/** Pauses a strategy: the scheduler's ensureDueCycles/listActiveStrategies will skip it entirely — no new cycles are created while paused. Cycles already pending/in_progress are unaffected (they still resolve normally). */
+export function pauseStrategy(db: Database.Database, id: number): StrategyRow | undefined {
+  db.prepare("UPDATE strategies SET status = 'paused' WHERE id = ?").run(id);
+  return getStrategy(db, id);
+}
+
+export function resumeStrategy(db: Database.Database, id: number): StrategyRow | undefined {
+  db.prepare("UPDATE strategies SET status = 'active' WHERE id = ?").run(id);
+  return getStrategy(db, id);
+}
+
+export function getLatestExecution(db: Database.Database, strategyId: number) {
+  return db.prepare("SELECT * FROM executions WHERE strategy_id = ? ORDER BY id DESC LIMIT 1").get(strategyId) as
+    | Record<string, unknown>
+    | undefined;
+}
+
 export interface PaperState {
   strategyId: number;
   contributionsCount: number;
