@@ -15,6 +15,7 @@ Built for the Binance Agent OS Mini Hackathon (Track A).
 | Binance Agent OS MCP integration | ✅ **Real, verified with actual tool calls this session** — operator-side evidence layer, session-bound (no headless auth exists for it). See `docs/AGENT_OS_OPERATOR_WORKFLOW.md`. |
 | HedgeOS's own MCP server (Claude Code) | ✅ **Real, smoke-tested end-to-end** against the actual server subprocess. |
 | HedgeOS's own MCP server (Codex) | ✅ **Tested, working — verified 2026-09-08.** Real `codex exec` session, real MCP tool calls (`list_strategies`, `get_strategy_status`), real correct results. See `docs/OPERATOR_GUIDE.md`. |
+| Official Binance Skill (`binance`, a `binance-cli` wrapper — separate from the Agent OS MCP server) | ⚠️ **Installed, command surface inspected from source — not execution-verified.** Real `npx skills add` install (security-reviewed, Snyk: Med Risk, disclosed not hidden); its Futures reference docs confirm it can structurally target `NVDAUSDT`/`TRADIFI_PERPETUAL`, independently corroborating `EXECUTION_ROUTE_DECISION.md`. Its own `binance-cli` binary/installer was never run and no command was ever invoked through it — deliberately not wired into HedgeOS (would duplicate `liveExecution.ts`'s already-tested native code). See `docs/BINANCE_SKILLS_HUB_ASSESSMENT.md`. |
 | Live-execution adapter (real signing, order placement, reconciliation) | ✅ **Real code, mock-tested (28+ tests against a fake HTTP client, zero real network calls).** Fail-closed behind a 4-condition gate that nothing in this repo sets. **No real order has ever been placed.** |
 | Real authenticated preflight against a live account | ✅ **Actually run once, this session**, against the founder's own real (rotated, least-privilege) key — 10/10 read-only checks passed. See `LIVE_TRADING_READINESS.md`. |
 | Live orders | ❌ **Never placed.** Blocked on funding ($0 in both wallets as of the last check) and your explicit per-order authorization. |
@@ -157,3 +158,4 @@ Not a chatbot — the AI proposes and confirms, it doesn't compute money math. N
 - `docs/MULTI_TENANT_ARCHITECTURE.md` — design sketch for future multi-user hosting (not implemented)
 - `docs/LIVE_PREFLIGHT_SETUP.md` — secure per-user credential onboarding
 - `docs/INTEGRATION_SURFACES.md` — the four distinct integration surfaces, and why they're kept separate
+- `docs/BINANCE_SKILLS_HUB_ASSESSMENT.md` — official Binance Skills Hub research: what was installed, inspected, and why nothing was wired into HedgeOS's own execution path
