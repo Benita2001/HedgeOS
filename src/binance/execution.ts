@@ -62,7 +62,14 @@ export interface ExecutionAdapter {
    * fund); `LiveExecutionAdapter` does. Called by `runContribution` before
    * the hedge leg's `placeOrder`, when present.
    */
-  prepareFunding?(sizing: DcaHedgeSizingResult, idempotencyContext: OrderIdempotencyContext): Promise<FundingStepResult>;
+  /**
+   * `reservedFuturesUsd`, when given, OVERRIDES any constructor-time default
+   * with a freshly-computed figure (e.g. `getReservedFuturesUsd(db, strategyId)`)
+   * — reservation must be recomputed per call, not baked in once, since other
+   * strategies' positions change between cycles and one adapter instance may
+   * be reused across many strategies' cycles in a long-running worker process.
+   */
+  prepareFunding?(sizing: DcaHedgeSizingResult, idempotencyContext: OrderIdempotencyContext, reservedFuturesUsd?: number): Promise<FundingStepResult>;
 }
 
 /**

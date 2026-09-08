@@ -3,7 +3,7 @@ import { discoverPair } from "../binance/client.js";
 import type { ExecutionAdapter, Fill, SizedLeg, FundingStepResult } from "../binance/execution.js";
 import { sizeDcaHedgeContribution, sizeHedgeLeg } from "../engine/sizing.js";
 import { assertValidHedgeLeverage } from "../engine/types.js";
-import { getPaperState, type StrategyRow } from "../db/index.js";
+import { getPaperState, getReservedFuturesUsd, type StrategyRow } from "../db/index.js";
 
 export class UnsupportedPairError extends Error {
   constructor(
@@ -217,7 +217,11 @@ export async function runContribution(
     const fundingIdempotencyContext = cycleId !== undefined ? { strategyId: strategy.id, cycleId, leg: "hedge" as const } : undefined;
     if (fundingIdempotencyContext) {
       try {
-        fundingStep = await adapter.prepareFunding(sizing, fundingIdempotencyContext);
+        // Recomputed fresh from durable DB state every call — never a caller-supplied
+        // constant — so concurrent strategies sharing one Futures wallet can never
+        // double-count the same collateral. See getReservedFuturesUsd's own doc comment.
+        const reservedFuturesUsd = getReservedFuturesUsd(db, strategy.id);
+        fundingStep = await adapter.prepareFunding(sizing, fundingIdempotencyContext, reservedFuturesUsd);
       } catch (err) {
         // A funding-step failure must never silently vanish, but it also must NOT
         // block the hedge order attempt outright — the hedge leg's own placeOrder

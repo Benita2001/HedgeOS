@@ -188,6 +188,39 @@ export interface PaperState {
  * Aggregates the paper-mode position purely from persisted executions —
  * never recomputed from an LLM guess, never inferred from account balance.
  */
+/**
+ * How much of the account's Futures wallet is already spoken for by OTHER
+ * strategies sharing it — real collateral currently held in an open
+ * position (or partially filled), not a caller-supplied guess. Used by
+ * `planFunding` (via `LiveExecutionAdapter.prepareFunding`) so one
+ * strategy's funding decision can never double-count collateral another
+ * strategy is already relying on.
+ *
+ * Deliberately includes PAUSED strategies too — pausing stops new cycles
+ * from being scheduled, it does not release an already-open position's
+ * collateral back to the wallet. Only strategy_id itself is excluded (a
+ * strategy never "reserves against" its own prior collateral — that's
+ * already reflected in the real account balance `prepareFunding` reads
+ * fresh from the exchange).
+ *
+ * Known, disclosed limitation: this reflects durable, already-persisted
+ * executions only. A transfer or order for ANOTHER strategy that is
+ * in-flight in the same instant (already sent to the exchange, not yet
+ * reconciled/persisted) is not reflected here — a narrow race window, not
+ * eliminated by this fix. Recomputed fresh on every call (never cached),
+ * so it is at most one concurrent-cycle-width stale, never structurally
+ * wrong the way a caller-supplied constant could be.
+ */
+export function getReservedFuturesUsd(db: Database.Database, excludeStrategyId: number): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(CASE WHEN hedge_order_status IN ('filled','partially_filled') THEN hedge_actual_collateral_usd ELSE 0 END), 0) AS reserved
+       FROM executions WHERE strategy_id != ? AND mode = 'live'`,
+    )
+    .get(excludeStrategyId) as { reserved: number };
+  return row.reserved;
+}
+
 export function getPaperState(db: Database.Database, strategyId: number): PaperState {
   // Aggregates from ACTUAL FILLED quantities/notional, not the sizing
   // engine's requested amounts — a partial fill or a rejected leg (status

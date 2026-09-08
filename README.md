@@ -20,7 +20,7 @@ Built for the Binance Agent OS Mini Hackathon (Track A).
 | Real authenticated preflight against a live account | ✅ **Actually run once, this session**, against the founder's own real (rotated, least-privilege) key — 10/10 read-only checks passed. See `LIVE_TRADING_READINESS.md`. |
 | Live orders | ❌ **Never placed.** Blocked on funding ($0 in both wallets as of the last check) and your explicit per-order authorization. |
 | Funding-readiness check for any user's own account | ✅ **Real, tested**, read-only. `check_funding_readiness` MCP tool / `docs/FUNDING_READINESS.md`. |
-| Automatic Spot→Futures funding transfer | ⚠️ **Real code, mock-tested (28 tests, zero real network calls), wired into the recurring lifecycle (`ExecutionAdapter.prepareFunding`), gated separately from live trading.** Defaults to `prefunded` (no transfer ever attempted); `auto` mode requires an explicit per-cycle cap plus a separate runtime gate. **Never executed against a real account** — and the currently-installed real credential has `enableInternalTransfer: false`, so it couldn't be even if the gate were set. See `docs/FUNDING_READINESS.md`. |
+| Automatic Spot→Futures funding transfer | ⚠️ **Real code, mock-tested (34 tests, zero real network calls), wired into the recurring lifecycle (`ExecutionAdapter.prepareFunding`), gated separately from live trading.** Defaults to `prefunded` (no transfer ever attempted); `auto` mode requires an explicit per-cycle cap plus a separate runtime gate. Shared-wallet reservation derived for real from durable DB state (`getReservedFuturesUsd`) — concurrent strategies can't double-count the same collateral. **Never executed against a real account.** `enableInternalTransfer` is now confirmed `true` on the real credential (verified this session) — funding, not permissions, is what's left. See `docs/FUNDING_READINESS.md`. |
 | Self-hosted install for a second, independent user | ✅ **Deploy tooling is generic** (parameterized by `HEDGEOS_DEPLOY_HOST`, no hardcoded IP/paths — verified by grep this session). `docs/SELF_HOSTED_INSTALL.md`. |
 | Multi-tenant hosting (many users, one shared instance) | ❌ **Not built.** Architecture documented in `docs/MULTI_TENANT_ARCHITECTURE.md` — explicitly a design sketch, not a claim of implementation. |
 | Natural-language strategy proposals: any amount, any cadence ("...every 10 minutes"), finite duration ("...for six months") | ✅ **Workflow documented** (`docs/OPERATOR_GUIDE.md`) and **cadence + duration enforcement are real and tested**: `strategies.interval_minutes` (generic whole-minute cadence, overrides `frequency`, 1-minute documented floor tied to the worker's own tick granularity — not any specific demo value) and `strategies.end_at` (optional end date), both migration-tested against a pre-existing database, both enforced deterministically by the scheduler (`ensureDueCycles`) — no cycle ever created past `end_at`, missed-cycle catch-up correctly capped near any boundary, a schedule ending never touches accumulated positions. The AI extracts intent and computes concrete values; only the deterministic engine enforces them — not independent LLM reasoning about trading decisions. |
@@ -79,7 +79,7 @@ src/
 
 ```bash
 npm install
-npm test              # 176 tests
+npm test              # 182 tests
 npx tsc --noEmit       # typecheck
 ```
 

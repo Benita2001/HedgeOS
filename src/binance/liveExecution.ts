@@ -482,9 +482,14 @@ export class LiveExecutionAdapter implements ExecutionAdapter {
    * default), this only ever reports the plan; it never calls the transfer
    * gate or endpoint at all.
    */
-  async prepareFunding(sizing: DcaHedgeSizingResult, _idempotencyContext: OrderIdempotencyContext): Promise<FundingStepResult> {
+  async prepareFunding(sizing: DcaHedgeSizingResult, _idempotencyContext: OrderIdempotencyContext, reservedFuturesUsd?: number): Promise<FundingStepResult> {
+    // Prefer a freshly-computed figure from the caller (real, per-cycle, DB-derived —
+    // see getReservedFuturesUsd) over this instance's constructor-time default, which
+    // exists only so the class remains constructible/testable without a live DB.
+    const reserved = reservedFuturesUsd ?? this.reservedFuturesUsd;
+
     if (!sizing.hedge.executable) {
-      return { attempted: false, plan: planFunding({ ticker: "", sizing, futuresAvailableUsd: 0, reservedFuturesUsd: this.reservedFuturesUsd, policy: this.fundingPolicy }) };
+      return { attempted: false, plan: planFunding({ ticker: "", sizing, futuresAvailableUsd: 0, reservedFuturesUsd: reserved, policy: this.fundingPolicy }) };
     }
 
     const futuresAccount = await this.client.send<{ availableBalance?: string }>(
@@ -492,7 +497,7 @@ export class LiveExecutionAdapter implements ExecutionAdapter {
     );
     const futuresAvailableUsd = Number(futuresAccount.availableBalance ?? 0);
 
-    const plan = planFunding({ ticker: "", sizing, futuresAvailableUsd, reservedFuturesUsd: this.reservedFuturesUsd, policy: this.fundingPolicy });
+    const plan = planFunding({ ticker: "", sizing, futuresAvailableUsd, reservedFuturesUsd: reserved, policy: this.fundingPolicy });
 
     if (plan.action !== "transfer_required" && plan.action !== "capped_still_insufficient") {
       return { attempted: false, plan };
