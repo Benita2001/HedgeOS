@@ -25,8 +25,39 @@ Built for the Binance Agent OS Mini Hackathon (Track A).
 | Multi-tenant hosting (many users, one shared instance) | ❌ **Not built.** Architecture documented in `docs/MULTI_TENANT_ARCHITECTURE.md` — explicitly a design sketch, not a claim of implementation. |
 | Natural-language strategy proposals: any amount, any cadence ("...every 10 minutes"), finite duration ("...for six months") | ✅ **Workflow documented** (`docs/OPERATOR_GUIDE.md`) and **cadence + duration enforcement are real and tested**: `strategies.interval_minutes` (generic whole-minute cadence, overrides `frequency`, 1-minute documented floor tied to the worker's own tick granularity — not any specific demo value) and `strategies.end_at` (optional end date), both migration-tested against a pre-existing database, both enforced deterministically by the scheduler (`ensureDueCycles`) — no cycle ever created past `end_at`, missed-cycle catch-up correctly capped near any boundary, a schedule ending never touches accumulated positions. The AI extracts intent and computes concrete values; only the deterministic engine enforces them — not independent LLM reasoning about trading decisions. |
 | Full recurring live lifecycle (due cycle → stock order → reconciliation → re-derived hedge sizing → hedge order → reconciliation → receipt → next cycle) | ✅ **Real code, integration-tested** across two consecutive cycles with a live-shaped mock adapter (`tests/liveLifecycle.test.ts`) — proves a mid-lifecycle failure in one cycle doesn't corrupt an earlier cycle's real fill or block future scheduling. Still gated: no real order has ever been placed. |
+| Autonomous live execution lifecycle (draft → authorized → worker auto-executes) | ✅ **Real code, deployed, tested (21 tests).** `create_live_strategy` (draft, places nothing) → `authorize_live_strategy` (required, separate, explicit) → the worker re-checks authorization/expiry/capital-exhaustion on every due cycle before ever constructing a real adapter. A paused/expired/exhausted/unauthorized strategy never executes — verified by reproducing the worker's exact gate logic in tests, not just asserted. **No strategy has ever actually been authorized on the real account.** |
 
 Full evidence, checkpoint by checkpoint: `PROGRESS_LOG.md`.
+
+## Proof
+
+### Paper-mode proof — done, real, reproducible
+
+Everything below actually happened, this session, against the real deployed VPS and real live market data — not asserted, not simulated evidence of evidence.
+
+- **Real autonomous execution, unattended.** Strategy #2 (AAPL, $77/cycle, every 5 minutes) fired **on its own**, via the persistent worker's own tick — not a manual trigger — 5 minutes after creation, with zero operator action in between. Two consecutive real cycles, both `completed`:
+  | Cycle | Stock (AAPLBUSDT BUY) | Hedge (AAPLUSDT SELL) |
+  |---|---|---|
+  | #2 (manual trigger) | 0.218 @ $316.47 = $68.99 | 0.04 @ $316.56 = $12.66 |
+  | #3 (**autonomous worker tick**) | 0.218 @ $316.48 = $68.99 | 0.04 @ $316.56 = $12.66 |
+
+  Both `mode=paper`, `simulated=1` in the durable `receipts` table — pulled directly from the production SQLite file, not a log line.
+- **Real restart recovery.** The worker has been restarted multiple times across this session (redeployments) — every time, `journalctl` shows `no interrupted cycles found at startup` and zero duplicate executions, confirmed by direct row counts, not just log trust.
+- **Real Binance Agent OS MCP calls**, this session: `spot_tickerPrice`, `futures_usds_symbolPriceTicker`, `futures_usds_exchangeInformation`, `wallet_getApiKeyPermission` — actual tool names, actual results, cross-checked against HedgeOS's own independent public-REST discovery before any sizing decision.
+- **Real Codex session**: `codex mcp add` + a live `codex exec` run that correctly called `list_strategies`/`get_strategy_status` against the real deployed database (session id `01a0824a-e323-7631-be0c-c5ad5937e245`).
+- **Real deployment discipline**: a genuine rsync bug (an older multi-source invocation silently dropped new files) was caught by comparing file counts before trusting the deploy, not assumed clean — documented in `PROGRESS_LOG.md` checkpoint 15 rather than glossed over.
+- **211/211 tests passing**, on this machine and independently re-run on the VPS itself, clean typecheck both places.
+
+### Live (real-money) proof — not yet done, this section gets filled in when it is
+
+Nothing below has happened. No real order has been placed; no funds have been transferred. Live execution code is real, tested (61+ tests against a mocked HTTP client — see `LiveExecutionAdapter`, `fundingReadiness.ts`, `fundingTransfer.ts`, `reserveFundingAtomically`), deployed, and gated behind independent environment conditions nothing in this repo sets. A real, authenticated, read-only preflight has been run repeatedly against the account owner's own key (see `LIVE_TRADING_READINESS.md`) — permissions and balances are tracked there, not claimed here.
+
+When a real controlled cycle actually executes, this section will be replaced with:
+- the real strategy id, ticker, contribution amount, and leverage (whatever the account owner actually chose — not a fixed demo value)
+- the real Binance order IDs and `tranId` (if a funding transfer occurred) for both legs
+- the real fill prices/quantities/fees, pulled from the account owner's own trade history via the same reconciliation path already tested, not asserted
+- the real durable receipt row, exactly as read from the production database
+- confirmation that the position was independently verified against the exchange's own account state, not just HedgeOS's local record
 
 ## The observe → decide → act → verify loop
 
@@ -79,7 +110,7 @@ src/
 
 ```bash
 npm install
-npm test              # 190 tests
+npm test              # 211 tests
 npx tsc --noEmit       # typecheck
 ```
 
@@ -142,7 +173,7 @@ export HEDGEOS_DEPLOY_HOST=root@<your-host>
 
 ## What this is not
 
-Not a chatbot — the AI proposes and confirms, it doesn't compute money math. Not a guarantee of downside protection, a continuous 10% hedge ratio, or a maximum-loss cap. Not (yet) connected to real money. Not multi-tenant. Not verified against Codex.
+Not a chatbot — the AI proposes and confirms, it doesn't compute money math. Not a guarantee of downside protection, a continuous 10% hedge ratio, or a maximum-loss cap. Not (yet) connected to real money — no order placed, no strategy authorized, on any real account. Not multi-tenant.
 
 ## Documents
 
