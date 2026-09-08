@@ -36,10 +36,30 @@ export interface OrderIdempotencyContext {
   leg: "stock" | "hedge";
 }
 
+export interface FundingReservationHandle {
+  reservationId: number;
+}
+
+/**
+ * Injected by the caller (which has DB access — `LiveExecutionAdapter`
+ * deliberately doesn't) to atomically reserve a transfer amount against
+ * concurrent strategies BEFORE actually transferring — see
+ * `reserveFundingAtomically` (`db/index.ts`) for the locking mechanics.
+ * `futuresAvailableUsd`/`reservedByOthersUsd` are the exact figures
+ * `prepareFunding` already computed the plan from, passed through so the
+ * atomic check is consistent with what was planned, not re-fetched.
+ */
+export type ReserveFundingFn = (
+  amountUsd: number,
+  futuresAvailableUsd: number,
+  reservedByOthersUsd: number,
+) => Promise<{ reserved: boolean; reservationId?: number; reason?: string }>;
+
 export interface FundingStepResult {
   attempted: boolean;
   plan?: FundingPlan;
   transfer?: TransferReceipt;
+  reservation?: FundingReservationHandle;
 }
 
 export interface ExecutionAdapter {
@@ -69,7 +89,12 @@ export interface ExecutionAdapter {
    * strategies' positions change between cycles and one adapter instance may
    * be reused across many strategies' cycles in a long-running worker process.
    */
-  prepareFunding?(sizing: DcaHedgeSizingResult, idempotencyContext: OrderIdempotencyContext, reservedFuturesUsd?: number): Promise<FundingStepResult>;
+  prepareFunding?(
+    sizing: DcaHedgeSizingResult,
+    idempotencyContext: OrderIdempotencyContext,
+    reservedFuturesUsd?: number,
+    reserveFn?: ReserveFundingFn,
+  ): Promise<FundingStepResult>;
 }
 
 /**

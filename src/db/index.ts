@@ -42,6 +42,110 @@ function runMigrations(db: Database.Database): void {
   if (!executionsColumns.some((c) => c.name === "funding_step_json")) {
     db.exec("ALTER TABLE executions ADD COLUMN funding_step_json TEXT DEFAULT NULL");
   }
+  const hasFundingReservations = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='funding_reservations'").get() as { name: string } | undefined) !== undefined;
+  if (!hasFundingReservations) {
+    db.exec(`
+      CREATE TABLE funding_reservations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        strategy_id INTEGER NOT NULL REFERENCES strategies(id),
+        cycle_id INTEGER NOT NULL REFERENCES cycles(id),
+        amount_usd REAL NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'released')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        resolved_at TEXT,
+        UNIQUE (strategy_id, cycle_id)
+      )
+    `);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_funding_reservations_status ON funding_reservations(status)");
+  }
+}
+
+/** Minutes after which a still-'pending' reservation is treated as abandoned (its cycle almost
+ * certainly crashed/timed out — cycles.claimCycle's own restart-recovery path resolves the cycle
+ * itself; this is the analogous staleness cutoff for the reservation row so a genuinely abandoned
+ * reservation doesn't permanently and incorrectly reduce other strategies' available funding). A
+ * fresh retry of the SAME cycle reuses its existing reservation row via the UNIQUE constraint,
+ * never creates a second one — staleness only matters for a reservation whose cycle was abandoned
+ * without ever resolving (crash before any resolution), not for a normal retry. */
+export const FUNDING_RESERVATION_STALE_AFTER_MINUTES = 15;
+
+export interface FundingReservation {
+  id: number;
+  strategy_id: number;
+  cycle_id: number;
+  amount_usd: number;
+  status: "pending" | "confirmed" | "released";
+  created_at: string;
+  resolved_at: string | null;
+}
+
+/**
+ * Atomically checks the account's real Futures balance (fetched by the
+ * caller, since it's an external read) against every OTHER strategy's
+ * durable commitment — confirmed collateral (`executions`) PLUS other
+ * strategies' still-`pending` reservations — and, if sufficient, reserves
+ * the requested amount for THIS (strategyId, cycleId) in the SAME
+ * transaction. Runs under `db.transaction(...).immediate()`: better-
+ * sqlite3/SQLite acquires a RESERVED lock before executing anything
+ * inside, so a second process calling this concurrently for a different
+ * strategy genuinely cannot interleave with the first — it blocks until
+ * the first transaction commits, then reads the first's reservation as
+ * already-committed fact. This is what closes the race the plain
+ * sum-of-filled-collateral check could not: two concurrent callers can
+ * never both observe "sufficient" for the same dollar.
+ *
+ * Idempotent for retries of the SAME cycle: the UNIQUE(strategy_id,
+ * cycle_id) constraint means a second call for a cycle that already has a
+ * reservation returns the EXISTING reservation (not a duplicate, not an
+ * error) — so a scheduler retry after a crash never double-reserves.
+ *
+ * Residual, disclosed limitation: `futuresAvailableUsd` is a snapshot read
+ * from the exchange moments before this call — a real balance change
+ * between that read and this transaction (e.g. an order placed by some
+ * other, non-HedgeOS process on the same account) is not, and cannot be,
+ * covered by a purely local lock. What this DOES fully close is HedgeOS's
+ * own concurrent strategies/processes racing each other locally.
+ */
+export function reserveFundingAtomically(
+  db: Database.Database,
+  args: { strategyId: number; cycleId: number; amountUsd: number; futuresAvailableUsd: number; reservedByOthersUsd: number },
+): { reserved: boolean; reservation?: FundingReservation; reason?: string } {
+  const tx = db.transaction(() => {
+    const existing = db
+      .prepare("SELECT * FROM funding_reservations WHERE strategy_id = ? AND cycle_id = ?")
+      .get(args.strategyId, args.cycleId) as FundingReservation | undefined;
+    if (existing) {
+      return { reserved: existing.status !== "released", reservation: existing, reason: `reservation already exists for this cycle (status=${existing.status})` };
+    }
+
+    // Re-read what's pending from OTHER strategies INSIDE the lock — the value passed in by the
+    // caller was read just before acquiring it and could already be stale relative to a
+    // reservation another process committed in between; this final check is the one that's
+    // actually race-free.
+    const freshPendingRow = db
+      .prepare(
+        `SELECT COALESCE(SUM(amount_usd), 0) AS total FROM funding_reservations
+         WHERE strategy_id != ? AND status = 'pending' AND created_at >= datetime('now', ?)`,
+      )
+      .get(args.strategyId, `-${FUNDING_RESERVATION_STALE_AFTER_MINUTES} minutes`) as { total: number };
+
+    const unreserved = args.futuresAvailableUsd - args.reservedByOthersUsd - freshPendingRow.total;
+    if (unreserved < args.amountUsd - 0.005) {
+      return { reserved: false, reason: `insufficient unreserved balance at reservation time: available=${args.futuresAvailableUsd}, reservedByOthers=${args.reservedByOthersUsd}, pendingByOthers=${freshPendingRow.total}, requested=${args.amountUsd}` };
+    }
+
+    const info = db
+      .prepare("INSERT INTO funding_reservations (strategy_id, cycle_id, amount_usd, status) VALUES (?, ?, ?, 'pending')")
+      .run(args.strategyId, args.cycleId, args.amountUsd);
+    const reservation = db.prepare("SELECT * FROM funding_reservations WHERE id = ?").get(info.lastInsertRowid) as FundingReservation;
+    return { reserved: true, reservation };
+  });
+  return tx.immediate();
+}
+
+/** Marks a reservation resolved — 'confirmed' once the transfer is verified credited, 'released' if it never happened (deferred, insufficient, gate closed, or the transfer itself failed). Never left 'pending' forever by any code path that reaches a final outcome. */
+export function resolveFundingReservation(db: Database.Database, reservationId: number, outcome: "confirmed" | "released"): void {
+  db.prepare("UPDATE funding_reservations SET status = ?, resolved_at = datetime('now') WHERE id = ?").run(outcome, reservationId);
 }
 
 export function openDb(path = process.env.HEDGEOS_DB_PATH ?? "./data/hedgeos.db"): Database.Database {
@@ -212,13 +316,25 @@ export interface PaperState {
  * wrong the way a caller-supplied constant could be.
  */
 export function getReservedFuturesUsd(db: Database.Database, excludeStrategyId: number): number {
-  const row = db
+  const confirmedRow = db
     .prepare(
       `SELECT COALESCE(SUM(CASE WHEN hedge_order_status IN ('filled','partially_filled') THEN hedge_actual_collateral_usd ELSE 0 END), 0) AS reserved
        FROM executions WHERE strategy_id != ? AND mode = 'live'`,
     )
     .get(excludeStrategyId) as { reserved: number };
-  return row.reserved;
+  // Also count OTHER strategies' still-pending (not yet transferred/confirmed) reservations —
+  // this is what makes the figure fed into planFunding consistent with what
+  // reserveFundingAtomically will itself re-check inside its own lock; without this, a strategy
+  // could see "sufficient" here and only discover the real conflict at reservation time (still
+  // safe — reserveFundingAtomically is the actual source of truth — but this keeps the two checks
+  // in agreement rather than routinely disagreeing).
+  const pendingRow = db
+    .prepare(
+      `SELECT COALESCE(SUM(amount_usd), 0) AS pending FROM funding_reservations
+       WHERE strategy_id != ? AND status = 'pending' AND created_at >= datetime('now', ?)`,
+    )
+    .get(excludeStrategyId, `-${FUNDING_RESERVATION_STALE_AFTER_MINUTES} minutes`) as { pending: number };
+  return Math.round((confirmedRow.reserved + pendingRow.pending) * 100) / 100;
 }
 
 export function getPaperState(db: Database.Database, strategyId: number): PaperState {

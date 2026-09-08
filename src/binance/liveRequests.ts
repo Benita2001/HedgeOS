@@ -297,12 +297,24 @@ export interface RawTransferHistoryRow {
 }
 
 /**
- * Requires the `enableInternalTransfer` API-key permission specifically —
- * distinct from `enableWithdrawals` (never required or requested by this
- * project) and from `enableSpotAndMarginTrading`/`enableFutures` (trading
- * permissions, already held by this project's real credential per the
- * checkpoint-10 preflight). This is the ONE additional narrow permission
- * automatic funding needs — it does not touch withdrawal capability.
+ * CORRECTED this session: two DISTINCT API-key permission flags are
+ * relevant here, not one. `enableInternalTransfer` alone is NOT sufficient
+ * — a real preflight against this project's actual account showed
+ * `enableInternalTransfer: true` but `permitsUniversalTransfer: false`
+ * simultaneously, and independent sources (Binance community forum,
+ * third-party API references — the official docs site itself did not
+ * render field-level detail to this session's tools) describe
+ * `permitsUniversalTransfer` ("Permits Universal Transfer" in the Binance
+ * UI) as the flag this specific endpoint, `POST /sapi/v1/asset/transfer`,
+ * actually requires. Neither flag touches `enableWithdrawals` (never
+ * required or requested by this project).
+ *
+ * This is a real, disclosed verification gap, not resolved with certainty:
+ * this session could not get the official docs page itself to render
+ * field-level requirements to automated tools, despite multiple attempts.
+ * `scripts/live-preflight.ts` now reports BOTH flags — treat the transfer
+ * as blocked unless `permitsUniversalTransfer` reads `true` on a real
+ * preflight, regardless of what `enableInternalTransfer` shows.
  */
 export function buildUserUniversalTransferRequest(args: {
   apiKey: string;

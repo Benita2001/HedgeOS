@@ -1,4 +1,4 @@
-import type { ExecutionAdapter, Fill, SizedLeg, OrderIdempotencyContext, FundingStepResult } from "./execution.js";
+import type { ExecutionAdapter, Fill, SizedLeg, OrderIdempotencyContext, FundingStepResult, ReserveFundingFn, FundingReservationHandle } from "./execution.js";
 import type { DcaHedgeSizingResult } from "../engine/types.js";
 import { planFunding, type FundingPolicy } from "./fundingReadiness.js";
 import { assertAutoFundingGate, executeAutoFundingTransfer } from "./fundingTransfer.js";
@@ -482,7 +482,12 @@ export class LiveExecutionAdapter implements ExecutionAdapter {
    * default), this only ever reports the plan; it never calls the transfer
    * gate or endpoint at all.
    */
-  async prepareFunding(sizing: DcaHedgeSizingResult, _idempotencyContext: OrderIdempotencyContext, reservedFuturesUsd?: number): Promise<FundingStepResult> {
+  async prepareFunding(
+    sizing: DcaHedgeSizingResult,
+    _idempotencyContext: OrderIdempotencyContext,
+    reservedFuturesUsd?: number,
+    reserveFn?: ReserveFundingFn,
+  ): Promise<FundingStepResult> {
     // Prefer a freshly-computed figure from the caller (real, per-cycle, DB-derived —
     // see getReservedFuturesUsd) over this instance's constructor-time default, which
     // exists only so the class remains constructible/testable without a live DB.
@@ -509,7 +514,25 @@ export class LiveExecutionAdapter implements ExecutionAdapter {
     // Separate, independent fail-closed gate from live-trading itself — throws if not explicitly authorized.
     assertAutoFundingGate();
 
+    // Atomically claim this exact amount against concurrent strategies BEFORE transferring —
+    // see reserveFundingAtomically's own doc comment for why this, not the plan's own
+    // reservedFuturesUsd figure (computed moments earlier, outside any lock), is what actually
+    // closes the race. Without a reserveFn (e.g. a test constructing this adapter directly),
+    // proceeds unreserved — real runtime wiring (runContribution.ts) always supplies one.
+    let reservation: FundingReservationHandle | undefined;
+    if (reserveFn) {
+      const reserveResult = await reserveFn(plan.transferAmountUsd, futuresAvailableUsd, reserved);
+      if (!reserveResult.reserved) {
+        return {
+          attempted: false,
+          plan,
+          transfer: { tranId: null, requestedAmountUsd: plan.transferAmountUsd, status: "failed", reason: `funding reservation refused: ${reserveResult.reason ?? "unknown"}` },
+        };
+      }
+      if (reserveResult.reservationId !== undefined) reservation = { reservationId: reserveResult.reservationId };
+    }
+
     const transfer = await executeAutoFundingTransfer(this.client, this.creds, { asset: "USDT", amountUsd: plan.transferAmountUsd });
-    return { attempted: true, plan, transfer };
+    return { attempted: true, plan, transfer, reservation };
   }
 }

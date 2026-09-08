@@ -1,9 +1,9 @@
 import type Database from "better-sqlite3";
 import { discoverPair } from "../binance/client.js";
-import type { ExecutionAdapter, Fill, SizedLeg, FundingStepResult } from "../binance/execution.js";
+import type { ExecutionAdapter, Fill, SizedLeg, FundingStepResult, ReserveFundingFn } from "../binance/execution.js";
 import { sizeDcaHedgeContribution, sizeHedgeLeg } from "../engine/sizing.js";
 import { assertValidHedgeLeverage } from "../engine/types.js";
-import { getPaperState, getReservedFuturesUsd, type StrategyRow } from "../db/index.js";
+import { getPaperState, getReservedFuturesUsd, reserveFundingAtomically, resolveFundingReservation, type StrategyRow } from "../db/index.js";
 
 export class UnsupportedPairError extends Error {
   constructor(
@@ -221,7 +221,23 @@ export async function runContribution(
         // constant — so concurrent strategies sharing one Futures wallet can never
         // double-count the same collateral. See getReservedFuturesUsd's own doc comment.
         const reservedFuturesUsd = getReservedFuturesUsd(db, strategy.id);
-        fundingStep = await adapter.prepareFunding(sizing, fundingIdempotencyContext, reservedFuturesUsd);
+        // Injected so the adapter (deliberately DB-decoupled) can atomically claim the
+        // exact transfer amount inside a real SQLite-locked transaction before actually
+        // transferring — see reserveFundingAtomically's own doc comment.
+        const reserveFn: ReserveFundingFn = async (amountUsd, futuresAvailableUsd, reservedByOthersUsd) => {
+          const result = reserveFundingAtomically(db, {
+            strategyId: strategy.id,
+            cycleId: fundingIdempotencyContext.cycleId,
+            amountUsd,
+            futuresAvailableUsd,
+            reservedByOthersUsd,
+          });
+          return { reserved: result.reserved, reservationId: result.reservation?.id, reason: result.reason };
+        };
+        fundingStep = await adapter.prepareFunding(sizing, fundingIdempotencyContext, reservedFuturesUsd, reserveFn);
+        if (fundingStep.reservation) {
+          resolveFundingReservation(db, fundingStep.reservation.reservationId, fundingStep.transfer?.status === "confirmed" ? "confirmed" : "released");
+        }
       } catch (err) {
         // A funding-step failure must never silently vanish, but it also must NOT
         // block the hedge order attempt outright — the hedge leg's own placeOrder

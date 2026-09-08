@@ -76,8 +76,15 @@ async function main() {
   results.push(
     await safeCheck("API key permission flags", "GET /sapi/v1/account/apiRestrictions", async () => {
       const r = await client.send<Record<string, unknown>>(buildApiRestrictionsRequest({ ...creds, timestamp: ts() }));
-      const { ipRestrict, enableReading, enableWithdrawals, enableInternalTransfer, enableMargin, enableFutures, enableSpotAndMarginTrading } = r as Record<string, boolean>;
-      return { ipRestrict, enableReading, enableWithdrawals, enableInternalTransfer, enableMargin, enableFutures, enableSpotAndMarginTrading };
+      // permitsUniversalTransfer is a DISTINCT flag from enableInternalTransfer — confirmed via a real
+      // Agent OS read earlier this project (a different account showed enableInternalTransfer:false
+      // AND permitsUniversalTransfer:true simultaneously) and via community/official-doc search this
+      // session. The universal-transfer endpoint (POST /sapi/v1/asset/transfer) requires this flag
+      // specifically per Binance's own documentation ("enable Permits Universal Transfer for the API
+      // Key") — checking only enableInternalTransfer was an incomplete check, now fixed.
+      const { ipRestrict, enableReading, enableWithdrawals, enableInternalTransfer, permitsUniversalTransfer, enableMargin, enableFutures, enableSpotAndMarginTrading } =
+        r as Record<string, boolean>;
+      return { ipRestrict, enableReading, enableWithdrawals, enableInternalTransfer, permitsUniversalTransfer, enableMargin, enableFutures, enableSpotAndMarginTrading };
     }),
   );
 

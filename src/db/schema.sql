@@ -126,3 +126,24 @@ CREATE TABLE IF NOT EXISTS cycles (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cycles_strategy_status ON cycles(strategy_id, status);
+
+-- A durable, atomically-claimed reservation against the shared Futures wallet, created
+-- BEFORE a transfer is attempted (not just inferred afterward from a filled execution).
+-- UNIQUE(strategy_id, cycle_id) makes reserving for the same due cycle twice a no-op —
+-- the same idempotency guarantee `cycles.idempotency_key` gives the cycle-claim path.
+-- 'pending' = reserved, transfer not yet confirmed; 'confirmed' = the transfer completed
+-- (the real execution row is now the durable record; kept for audit); 'released' = the
+-- funding step did not end up transferring (deferred/insufficient/gate closed) — the
+-- amount is no longer spoken for.
+CREATE TABLE IF NOT EXISTS funding_reservations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_id INTEGER NOT NULL REFERENCES strategies(id),
+  cycle_id INTEGER NOT NULL REFERENCES cycles(id),
+  amount_usd REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'released')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  resolved_at TEXT,
+  UNIQUE (strategy_id, cycle_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_reservations_status ON funding_reservations(status);
