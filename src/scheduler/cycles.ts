@@ -117,6 +117,16 @@ export async function processCycle(
       db.prepare(
         `UPDATE cycles SET status = 'completed', execution_id = ?, completed_at = datetime('now'), last_error = NULL WHERE id = ?`,
       ).run(receipt.executionId, cycle.id);
+    } else if (receipt.status === "partial_failure") {
+      // One leg filled (or partially filled) and the other was rejected.
+      // This is deliberately terminal for automatic retry: re-running the
+      // cycle would double the leg that already executed. It needs a human
+      // (or a dedicated single-leg reconciliation feature, not built here)
+      // to look at the receipt and decide what to do — never a blind replay.
+      db.prepare(
+        `UPDATE cycles SET status = 'failed_terminal', execution_id = ?, completed_at = datetime('now'),
+         last_error = 'partial cycle failure — one leg executed and one was rejected; needs manual review, not auto-retry' WHERE id = ?`,
+      ).run(receipt.executionId, cycle.id);
     } else {
       // unsupported_pair: an execution row exists (recording the attempt),
       // but this cycle cannot succeed by retrying the same ticker, so it is

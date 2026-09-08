@@ -71,19 +71,21 @@ describe("runContribution — supported pair, paper mode", () => {
     expect(receipt.mode).toBe("paper");
 
     // Distinct accounting values, never conflated:
-    expect(receipt.hedge!.hedgeBudgetUsd).toBeCloseTo(10, 6);
+    expect(receipt.hedge!.budgetUsd).toBeCloseTo(10, 6);
     expect(receipt.hedge!.targetShortNotionalUsd).toBeCloseTo(20, 6); // 10 * 2x
-    expect(receipt.hedge!.actualShortNotionalUsd).toBeLessThanOrEqual(receipt.hedge!.targetShortNotionalUsd);
-    expect(receipt.hedge!.actualCollateralUsd).toBeLessThanOrEqual(receipt.hedge!.hedgeBudgetUsd + 1e-9);
-    expect(receipt.hedge!.actualCollateralUsd).not.toEqual(receipt.hedge!.actualShortNotionalUsd);
+    expect(receipt.hedge!.requestedNotionalUsd).toBeLessThanOrEqual(receipt.hedge!.targetShortNotionalUsd);
+    expect(receipt.hedge!.actualCollateralUsd).toBeLessThanOrEqual(receipt.hedge!.budgetUsd + 1e-9);
+    expect(receipt.hedge!.actualCollateralUsd).not.toEqual(receipt.hedge!.requestedNotionalUsd);
 
     // Real fills recorded (simulated, but against the mocked live-shaped price).
-    expect(receipt.stock!.simulatedFillQty).toBeGreaterThan(0);
-    expect(receipt.hedge!.simulatedFillQty).toBeGreaterThan(0);
+    expect(receipt.stock!.filledQty).toBeGreaterThan(0);
+    expect(receipt.hedge!.filledQty).toBeGreaterThan(0);
+    expect(receipt.stock!.orderStatus).toBe("filled");
+    expect(receipt.hedge!.orderStatus).toBe("filled");
 
     // Paper state recomputed from the ledger, not asserted separately.
     expect(receipt.paperState!.contributionsCount).toBe(1);
-    expect(receipt.paperState!.cumulativeStockQty).toEqual(receipt.stock!.simulatedFillQty);
+    expect(receipt.paperState!.cumulativeStockQty).toEqual(receipt.stock!.filledQty);
   });
 
   it("defers (not drops, not oversizes) a hedge budget too small to clear the exchange minimum", async () => {
@@ -100,8 +102,68 @@ describe("runContribution — supported pair, paper mode", () => {
 
     if (!receipt.hedge!.executable) {
       expect(receipt.hedge!.deferredThisContributionUsd).toBeCloseTo(1, 6);
-      expect(receipt.hedge!.simulatedFillQty).toBe(0);
+      expect(receipt.hedge!.filledQty).toBe(0);
     }
+  });
+});
+
+describe("runContribution — partial fills and rejections (Priority 3 realism)", () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = freshDb();
+    vi.mocked(discoverPair).mockResolvedValue(SUPPORTED_DISCOVERY as never);
+  });
+  afterEach(() => db.close());
+
+  it("records a partial fill distinctly from the requested quantity, and paperState reflects only what actually filled", async () => {
+    const strategy = createStrategy(db, {
+      ticker: "NVDA",
+      spotSymbol: "NVDABUSDT",
+      futuresSymbol: "NVDAUSDT",
+      contributionUsd: 100,
+      frequency: "weekly",
+      hedgeLeverage: 2,
+    });
+
+    const adapter = new PaperExecutionAdapter({
+      simulateFill: (symbol, side, leg) =>
+        side === "BUY" ? { quantity: leg.quantity / 2, status: "partially_filled", reason: "test-simulated thin liquidity" } : undefined,
+    });
+
+    const receipt = await runContribution(db, strategy, adapter);
+
+    expect(receipt.status).toBe("completed"); // a partial fill is not a rejection — still a valid, recorded outcome
+    expect(receipt.stock!.orderStatus).toBe("partially_filled");
+    expect(receipt.stock!.filledQty).toBeLessThan(receipt.stock!.requestedQty);
+    expect(receipt.stock!.filledQty).toBeGreaterThan(0);
+    expect(receipt.paperState!.cumulativeStockQty).toEqual(receipt.stock!.filledQty);
+  });
+
+  it("marks the cycle partial_failure when one leg is rejected, and does not lose the leg that did fill", async () => {
+    const strategy = createStrategy(db, {
+      ticker: "NVDA",
+      spotSymbol: "NVDABUSDT",
+      futuresSymbol: "NVDAUSDT",
+      contributionUsd: 100,
+      frequency: "weekly",
+      hedgeLeverage: 2,
+    });
+
+    const adapter = new PaperExecutionAdapter({
+      simulateFill: (symbol, side) => (side === "SELL" ? { status: "rejected", reason: "test-simulated exchange rejection" } : undefined),
+    });
+
+    const receipt = await runContribution(db, strategy, adapter);
+
+    expect(receipt.status).toBe("partial_failure");
+    expect(receipt.stock!.orderStatus).toBe("filled");
+    expect(receipt.stock!.filledQty).toBeGreaterThan(0);
+    expect(receipt.hedge!.orderStatus).toBe("rejected");
+    expect(receipt.hedge!.filledQty).toBe(0);
+    // The stock leg that DID fill must still be reflected in paper state — never dropped because the other leg failed.
+    expect(receipt.paperState!.cumulativeStockQty).toEqual(receipt.stock!.filledQty);
+    expect(receipt.paperState!.cumulativeHedgeQty).toBe(0);
   });
 });
 

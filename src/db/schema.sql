@@ -17,14 +17,19 @@ CREATE TABLE IF NOT EXISTS executions (
   strategy_id INTEGER NOT NULL REFERENCES strategies(id),
   ts TEXT NOT NULL DEFAULT (datetime('now')),
   mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')),
-  status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('completed', 'unsupported_pair', 'failed')),
+  status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('completed', 'unsupported_pair', 'partial_failure', 'failed')),
   contribution_usd REAL NOT NULL,
   reference_price REAL NOT NULL,
 
-  -- stock leg
+  -- stock leg: "qty"/"notional" are the sizing engine's REQUESTED amount (post-filter-rounding);
+  -- "filled_qty"/"filled_notional" are what the execution adapter actually reports as filled —
+  -- these can differ (partial fill) and paper-state accounting always uses the filled values.
   stock_budget_usd REAL NOT NULL,
   stock_qty REAL NOT NULL,
   stock_notional_usd REAL NOT NULL,
+  stock_filled_qty REAL NOT NULL DEFAULT 0,
+  stock_filled_notional_usd REAL NOT NULL DEFAULT 0,
+  stock_order_status TEXT NOT NULL DEFAULT 'not_submitted' CHECK (stock_order_status IN ('not_submitted', 'filled', 'partially_filled', 'rejected')),
   stock_fee_usd REAL NOT NULL DEFAULT 0,
   stock_executable INTEGER NOT NULL,
   stock_skip_reason TEXT,
@@ -35,6 +40,9 @@ CREATE TABLE IF NOT EXISTS executions (
   hedge_target_short_notional_usd REAL NOT NULL,
   hedge_qty REAL NOT NULL,
   hedge_actual_short_notional_usd REAL NOT NULL,
+  hedge_filled_qty REAL NOT NULL DEFAULT 0,
+  hedge_filled_notional_usd REAL NOT NULL DEFAULT 0,
+  hedge_order_status TEXT NOT NULL DEFAULT 'not_submitted' CHECK (hedge_order_status IN ('not_submitted', 'filled', 'partially_filled', 'rejected')),
   hedge_actual_collateral_usd REAL NOT NULL,
   hedge_fee_usd REAL NOT NULL DEFAULT 0,
   hedge_executable INTEGER NOT NULL,
@@ -60,6 +68,8 @@ CREATE TABLE IF NOT EXISTS receipts (
   fee_usd REAL NOT NULL DEFAULT 0,
   mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')),
   order_id TEXT,
+  status TEXT NOT NULL DEFAULT 'filled' CHECK (status IN ('filled', 'partially_filled', 'rejected')),
+  reason TEXT,
   simulated INTEGER NOT NULL DEFAULT 1,
   ts TEXT NOT NULL DEFAULT (datetime('now'))
 );

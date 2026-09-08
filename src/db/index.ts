@@ -80,16 +80,22 @@ export interface PaperState {
  * never recomputed from an LLM guess, never inferred from account balance.
  */
 export function getPaperState(db: Database.Database, strategyId: number): PaperState {
+  // Aggregates from ACTUAL FILLED quantities/notional, not the sizing
+  // engine's requested amounts — a partial fill or a rejected leg (status
+  // partial_failure) must never be over-reported as fully executed.
+  // Includes every execution row (even a partial_failure or an
+  // unsupported_pair row, which simply contributes zeros) so whatever
+  // genuinely filled is always counted, regardless of the other leg's fate.
   const row = db
     .prepare(
       `SELECT
-         COUNT(*) AS contributionsCount,
-         COALESCE(SUM(stock_qty), 0) AS cumulativeStockQty,
-         COALESCE(SUM(stock_notional_usd), 0) AS cumulativeStockNotionalUsd,
-         COALESCE(SUM(hedge_qty), 0) AS cumulativeHedgeQty,
-         COALESCE(SUM(hedge_actual_collateral_usd), 0) AS cumulativeHedgeCollateralUsd,
+         COUNT(*) FILTER (WHERE status = 'completed') AS contributionsCount,
+         COALESCE(SUM(stock_filled_qty), 0) AS cumulativeStockQty,
+         COALESCE(SUM(stock_filled_notional_usd), 0) AS cumulativeStockNotionalUsd,
+         COALESCE(SUM(hedge_filled_qty), 0) AS cumulativeHedgeQty,
+         COALESCE(SUM(CASE WHEN hedge_order_status IN ('filled','partially_filled') THEN hedge_actual_collateral_usd ELSE 0 END), 0) AS cumulativeHedgeCollateralUsd,
          COALESCE(SUM(stock_fee_usd) + SUM(hedge_fee_usd), 0) AS cumulativeFeesUsd
-       FROM executions WHERE strategy_id = ? AND status = 'completed'`,
+       FROM executions WHERE strategy_id = ?`,
     )
     .get(strategyId) as Omit<PaperState, "strategyId" | "deferredHedgeBudgetUsd">;
 

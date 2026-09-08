@@ -150,6 +150,27 @@ describe("processCycle — success and failure classification", () => {
     expect(getPendingAndRetryableCycles(db).some((c) => c.id === cycle.id)).toBe(false);
   });
 
+  it("marks a cycle failed_terminal (never auto-retried) on a partial cycle failure — one leg filled, one rejected", async () => {
+    vi.mocked(discoverPair).mockResolvedValue(SUPPORTED_DISCOVERY as never);
+    const strategy = makeStrategy();
+    ensureDueCycles(db, strategy, new Date(strategy.next_due_at));
+    const [cycle] = db.prepare("SELECT * FROM cycles WHERE strategy_id = ?").all(strategy.id) as CycleRow[];
+    const claimed = claimCycle(db, cycle.id)!;
+
+    const adapter = new PaperExecutionAdapter({
+      simulateFill: (_symbol, side) => (side === "SELL" ? { status: "rejected", reason: "test-simulated" } : undefined),
+    });
+    const receipt = await processCycle(db, claimed, strategy, adapter);
+    expect(receipt.status).toBe("partial_failure");
+
+    const row = db.prepare("SELECT * FROM cycles WHERE id = ?").get(cycle.id) as CycleRow;
+    expect(row.status).toBe("failed_terminal");
+    // Critical safety property: never sitting in the retry queue, so a
+    // scheduler tick can never blindly re-run this cycle and double the
+    // leg (the stock buy) that already executed.
+    expect(getPendingAndRetryableCycles(db).some((c) => c.id === cycle.id)).toBe(false);
+  });
+
   it("marks a cycle failed_retryable on a transient (network-shaped) error, and it remains claimable", async () => {
     vi.mocked(discoverPair).mockRejectedValue(new Error("fetch failed: ETIMEDOUT contacting Binance API"));
     const strategy = makeStrategy();
