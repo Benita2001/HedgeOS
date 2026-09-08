@@ -11,42 +11,25 @@ import {
   ESTIMATED_TRADFI_PERP_TAKER_FEE_RATE,
   assertValidHedgeLeverage,
 } from "./types.js";
+import { fromScaled, floorToStep, mulScaled, divScaledFloor, toScaled } from "./decimal.js";
 
 /**
- * Snaps a raw quantity down to the exchange's stepSize using integer arithmetic
- * on the step's decimal precision, avoiding binary floating-point drift
- * (e.g. 0.1 + 0.2 !== 0.3) that is unacceptable in an order-sizing path.
- * Always rounds toward zero (down) — HedgeOS never rounds up past a budget.
+ * Snaps a raw quantity down to the exchange's stepSize using exact BigInt
+ * fixed-point arithmetic (see decimal.ts) — never rounds up, and never
+ * accumulates binary-float error the way `Math.floor(a/b)` on native
+ * numbers can (that was a real, fixed bug in Milestone 1).
  */
 export function snapDownToStep(rawQty: number, stepSize: number): number {
   if (stepSize <= 0) return rawQty;
-  const decimals = decimalPlaces(stepSize);
-  // The epsilon only cancels binary floating-point representation noise
-  // (e.g. 0.3/0.1 landing on 2.9999999996 instead of 3) — it must never be
-  // large enough to bump a genuinely-fractional unit count up to the next
-  // integer, or this would round UP, which is unacceptable in order sizing.
-  const steppedUnits = Math.floor(rawQty / stepSize + 1e-9);
-  return round(steppedUnits * stepSize, decimals);
-}
-
-function decimalPlaces(n: number): number {
-  const s = n.toString();
-  if (s.includes("e-")) {
-    return Number(s.split("e-")[1]);
-  }
-  const parts = s.split(".");
-  return parts.length > 1 ? parts[1].length : 0;
-}
-
-function round(n: number, decimals = 0): number {
-  const factor = 10 ** decimals;
-  return Math.round(n * factor) / factor;
+  const snapped = floorToStep(toScaled(rawQty), toScaled(stepSize));
+  return fromScaled(snapped);
 }
 
 /**
  * Sizes the stock leg deterministically: no LLM, no external call, pure
- * function of budget/price/filters. Returns executable=false rather than
- * silently trading below exchange minimums or rounding up past budget.
+ * function of budget/price/filters, exact fixed-point math throughout.
+ * Returns executable=false rather than silently trading below exchange
+ * minimums or rounding up past budget.
  */
 export function sizeStockLeg(budgetUsd: number, referencePrice: number, filters: SymbolFilters): StockLegSizingResult {
   if (referencePrice <= 0) {
@@ -59,9 +42,17 @@ export function sizeStockLeg(budgetUsd: number, referencePrice: number, filters:
       reason: "invalid reference price",
     };
   }
-  const rawQty = budgetUsd / referencePrice;
-  const snappedQty = snapDownToStep(rawQty, filters.stepSize);
-  const notionalUsd = round(snappedQty * referencePrice, 2);
+
+  const budgetScaled = toScaled(budgetUsd);
+  const priceScaled = toScaled(referencePrice);
+  const stepScaled = toScaled(filters.stepSize);
+
+  const rawQtyScaled = divScaledFloor(budgetScaled, priceScaled);
+  const snappedQtyScaled = floorToStep(rawQtyScaled, stepScaled);
+  const notionalScaled = mulScaled(snappedQtyScaled, priceScaled);
+
+  const snappedQty = fromScaled(snappedQtyScaled);
+  const notionalUsd = Math.round(fromScaled(notionalScaled) * 100) / 100;
 
   if (snappedQty <= 0 || snappedQty < filters.minQty) {
     return {
@@ -87,20 +78,21 @@ export function sizeStockLeg(budgetUsd: number, referencePrice: number, filters:
     budgetUsd,
     quantity: snappedQty,
     notionalUsd,
-    estimatedFeeUsd: round(notionalUsd * ESTIMATED_SPOT_TAKER_FEE_RATE, 4),
+    estimatedFeeUsd: Math.round(notionalUsd * ESTIMATED_SPOT_TAKER_FEE_RATE * 10000) / 10000,
     executable: true,
   };
 }
 
 /**
- * Sizes the hedge leg deterministically. The $X hedge allocation is treated
- * as collateral (margin) posted at a fixed leverage (2x default, 3x max in
- * P0) — the target short notional is hedgeBudgetUsd * leverage, snapped down
- * to the exchange's real filters. If even the smallest permitted order would
- * exceed the notional the budget can support, or the snapped notional falls
- * under the exchange minimum, the leg is not executed and the full budget is
- * reported as deferred — it is never dropped, never oversized past budget,
- * and leverage is never silently increased to force an execution.
+ * Sizes the hedge leg deterministically, exact fixed-point math throughout.
+ * The hedge collateral budget is posted margin at a fixed leverage (2x
+ * default, 3x max in P0) — target short notional is hedgeBudgetUsd *
+ * leverage, snapped down to the exchange's real filters. If even the
+ * smallest permitted order would exceed what the budget supports, or the
+ * snapped notional falls under the exchange minimum, the leg does not
+ * execute and the full budget is reported as deferred — never dropped,
+ * never oversized past budget, and leverage is never silently increased to
+ * force an execution through.
  */
 export function sizeHedgeLeg(
   hedgeBudgetUsd: number,
@@ -125,11 +117,21 @@ export function sizeHedgeLeg(
     };
   }
 
-  const targetShortNotionalUsd = round(hedgeBudgetUsd * leverage, 2);
-  const rawQty = targetShortNotionalUsd / referencePrice;
-  const snappedQty = snapDownToStep(rawQty, filters.stepSize);
-  const actualShortNotionalUsd = round(snappedQty * referencePrice, 2);
-  const actualCollateralUsd = round(actualShortNotionalUsd / leverage, 2);
+  const budgetScaled = toScaled(hedgeBudgetUsd);
+  const leverageScaled = toScaled(leverage);
+  const priceScaled = toScaled(referencePrice);
+  const stepScaled = toScaled(filters.stepSize);
+
+  const targetNotionalScaled = mulScaled(budgetScaled, leverageScaled);
+  const targetShortNotionalUsd = Math.round(fromScaled(targetNotionalScaled) * 100) / 100;
+
+  const rawQtyScaled = divScaledFloor(targetNotionalScaled, priceScaled);
+  const snappedQtyScaled = floorToStep(rawQtyScaled, stepScaled);
+  const actualNotionalScaled = mulScaled(snappedQtyScaled, priceScaled);
+
+  const snappedQty = fromScaled(snappedQtyScaled);
+  const actualShortNotionalUsd = Math.round(fromScaled(actualNotionalScaled) * 100) / 100;
+  const actualCollateralUsd = Math.round((actualShortNotionalUsd / leverage) * 100) / 100;
 
   const base = { hedgeBudgetUsd, leverage, targetShortNotionalUsd };
 
@@ -158,8 +160,8 @@ export function sizeHedgeLeg(
     };
   }
   if (actualCollateralUsd > hedgeBudgetUsd + 1e-6) {
-    // Defensive: should be unreachable given rounding-down above, but the
-    // hedge must never use more collateral than its allocated budget.
+    // Defensive: should be unreachable given exact floor-rounding above, but
+    // the hedge must never use more collateral than its allocated budget.
     return {
       ...base,
       quantity: 0,
@@ -177,9 +179,9 @@ export function sizeHedgeLeg(
     quantity: snappedQty,
     actualShortNotionalUsd,
     actualCollateralUsd,
-    estimatedFeeUsd: round(actualShortNotionalUsd * ESTIMATED_TRADFI_PERP_TAKER_FEE_RATE, 4),
+    estimatedFeeUsd: Math.round(actualShortNotionalUsd * ESTIMATED_TRADFI_PERP_TAKER_FEE_RATE * 10000) / 10000,
     executable: true,
-    deferredBudgetUsd: round(hedgeBudgetUsd - actualCollateralUsd, 2),
+    deferredBudgetUsd: Math.round((hedgeBudgetUsd - actualCollateralUsd) * 100) / 100,
   };
 }
 
@@ -203,8 +205,8 @@ export function sizeDcaHedgeContribution(
   }
   assertValidHedgeLeverage(policy.hedgeLeverage);
 
-  const stockBudget = round(contributionUsd * policy.stockFraction, 2);
-  const hedgeBudget = round(contributionUsd * policy.hedgeFraction, 2);
+  const stockBudget = Math.round(contributionUsd * policy.stockFraction * 100) / 100;
+  const hedgeBudget = Math.round(contributionUsd * policy.hedgeFraction * 100) / 100;
 
   const stock = sizeStockLeg(stockBudget, referencePrice, stockFilters);
   const hedge = sizeHedgeLeg(hedgeBudget, policy.hedgeLeverage, referencePrice, hedgeFilters);
