@@ -260,10 +260,14 @@ server.registerTool(
       }).default(DEFAULT_HEDGE_LEVERAGE),
       endAt: z.string().datetime().optional(),
       intervalMinutes: z.number().int().min(MIN_INTERVAL_MINUTES).optional(),
+      fundingMode: z.enum(["prefunded", "auto"]).default("prefunded"),
+      fundingBufferUsd: z.number().min(0).optional(),
+      fundingPerCycleCapUsd: z.number().positive().optional(),
+      fundingPeriodCapUsd: z.number().positive().optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   },
-  async ({ ticker, contributionUsd, frequency, hedgeLeverage, endAt, intervalMinutes }) => {
+  async ({ ticker, contributionUsd, frequency, hedgeLeverage, endAt, intervalMinutes, fundingMode, fundingBufferUsd, fundingPerCycleCapUsd, fundingPeriodCapUsd }) => {
     const upper = ticker.toUpperCase();
     try {
       const strategy = createStrategy(db, {
@@ -275,13 +279,20 @@ server.registerTool(
         hedgeLeverage,
         endAt,
         intervalMinutes,
+        fundingMode,
+        fundingBufferUsd,
+        fundingPerCycleCapUsd,
+        fundingPeriodCapUsd,
       });
       return textResult({
         created: strategy,
         note:
           "Paper mode. No order has been placed. The instrument pair will be (re-)validated at each contribution via live discovery." +
           (intervalMinutes ? ` Cadence: every ${intervalMinutes} minute(s), overriding frequency="${frequency}" for scheduling purposes.` : "") +
-          (endAt ? ` Schedule ends ${endAt} (inclusive) — no new contribution will be created after that date; accumulated positions are never auto-liquidated when a schedule ends.` : " Runs indefinitely (no endAt given) — pause it yourself when you're done."),
+          (endAt ? ` Schedule ends ${endAt} (inclusive) — no new contribution will be created after that date; accumulated positions are never auto-liquidated when a schedule ends.` : " Runs indefinitely (no endAt given) — pause it yourself when you're done.") +
+          (fundingMode === "auto"
+            ? ` Funding policy: AUTOMATIC — up to $${fundingPerCycleCapUsd} per cycle may be transferred Spot->Futures to cover the hedge collateral shortfall (buffer $${fundingBufferUsd ?? 0}${fundingPeriodCapUsd ? `, period cap $${fundingPeriodCapUsd}` : ""}). This ALSO requires the separate HEDGEOS_FUNDING_MODE/HEDGEOS_AUTO_FUNDING_CONFIRMED runtime gate to be set before any real transfer occurs — creating this strategy alone does not authorize one.`
+            : " Funding policy: PREFUNDED (default) — you top up the Futures wallet yourself; HedgeOS only reports shortfalls, never transfers automatically."),
       });
     } catch (err) {
       return errorResult((err as Error).message);

@@ -17,6 +17,16 @@ CREATE TABLE IF NOT EXISTS strategies (
   -- calendar cadence" — unchanged behavior. See src/scheduler/cadence.ts for the documented
   -- minimum (tied to the worker's own tick granularity, not any specific demo number).
   interval_minutes INTEGER DEFAULT NULL,
+  -- Per-strategy funding policy for the hedge leg's Futures collateral. 'prefunded' (the
+  -- default — identical to every strategy's behavior before this column existed) means the
+  -- user tops up the Futures wallet themselves; HedgeOS only ever reports a shortfall. 'auto'
+  -- additionally requires the separate assertAutoFundingGate env-var gate to actually transfer —
+  -- setting funding_mode='auto' here does NOT by itself authorize a real transfer.
+  funding_mode TEXT NOT NULL DEFAULT 'prefunded' CHECK (funding_mode IN ('prefunded', 'auto')),
+  -- Below are only meaningful when funding_mode='auto'; NULL/0 in 'prefunded' mode (unused).
+  funding_buffer_usd REAL NOT NULL DEFAULT 0,
+  funding_per_cycle_cap_usd REAL NOT NULL DEFAULT 0,
+  funding_period_cap_usd REAL DEFAULT NULL,
   -- Optional ISO timestamp: the scheduler creates no new cycle whose scheduled_for is after this
   -- (a cycle scheduled exactly at end_at is still created — inclusive boundary). NULL (the default,
   -- and the only value every strategy created before this column existed has) means "runs
@@ -66,7 +76,12 @@ CREATE TABLE IF NOT EXISTS executions (
   unrealized_pnl_usd REAL NOT NULL DEFAULT 0,
   strategy_nav_usd REAL,
 
-  skip_reason TEXT
+  skip_reason TEXT,
+
+  -- Automatic-funding step outcome for this cycle, as JSON (FundingStepResult — plan + transfer
+  -- receipt, or null if no funding step ran, e.g. paper mode or the hedge leg was deferred).
+  -- NULL for every execution before this column existed and for every paper-mode execution.
+  funding_step_json TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS receipts (

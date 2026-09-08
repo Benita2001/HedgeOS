@@ -123,8 +123,21 @@ User opened NVDAUSDT in the Binance app: market open, order form available, **no
 - **115/115 tests passing** (107 prior + 9 verify-config tests − 1 net from consolidation), typecheck clean.
 - **Explicitly NOT done**: no order placed, no leverage/margin actually changed on the real account this checkpoint (only the earlier read-only preflight touched the real account, and that was checkpoint 10), nothing synced/deployed to the VPS this checkpoint, live gate unchanged.
 
+## Checkpoint 12 — Automatic Spot->Futures funding: planner, transfer adapter, lifecycle wiring (2026-09-08 ~20:00-20:15 UTC)
+User confirmed automatic funding is part of product completeness. Built, but never executed against a real account:
+
+- **Verified real endpoints**: `POST /sapi/v1/asset/transfer` (create), `GET /sapi/v1/asset/transfer` (history) — confirmed against `developers.binance.com`'s Wallet Asset API endpoint list. Exact `type` enum value/full response schema not independently re-fetched field-by-field (docs site limitation this session) — flagged for a final manual check before real use.
+- **`planFunding` (`src/binance/fundingReadiness.ts`)**: deterministic — required collateral + configured buffer, actual balance, shared-wallet reservation subtraction, per-cycle and optional period caps, distinct `prefunded`/`auto` behavior. Never uses account NAV, never proposes transferring the full balance.
+- **`fundingTransfer.ts`**: real request builders, `assertAutoFundingGate` (separate from `assertLiveTradingGate`), ambiguous-outcome recovery via history lookup (never blind retry), confirmation polling (never trusts the POST response alone).
+- **Lifecycle wiring**: `ExecutionAdapter.prepareFunding` (optional method — `PaperExecutionAdapter` doesn't implement it, zero behavior change for paper mode), called by `runContribution` before the hedge leg, throw-captured so a funding failure can't lose the stock leg's record. `LiveExecutionAdapter` implements it for real, defaulting to `{mode:"prefunded", perCycleCapUsd:0}` so all 35 pre-existing tests and every current construction remain unchanged.
+- **Schema**: additive migration, `strategies.funding_mode/funding_buffer_usd/funding_per_cycle_cap_usd/funding_period_cap_usd` (default `prefunded`, identical to prior behavior), `executions.funding_step_json`. `createStrategy` refuses `funding_mode='auto'` without an explicit positive cap.
+- **MCP**: `create_paper_strategy` accepts the funding-policy fields; real end-to-end run (`scripts/funding-policy-demo.ts`) proved the refusal-without-cap and default-is-prefunded behaviors against the actual server.
+- **28 new tests** (`tests/fundingTransfer.test.ts`, `tests/autoFundingLifecycle.test.ts` — the real `LiveExecutionAdapter` class, mocked HTTP only): sufficient balance, exact shortfall, prefunded-never-transfers, per-cycle/period cap enforcement, ambiguous outcome + no-match + query-failure, delayed/never-confirmed transfer, gate on/off, shared-wallet reservation, hedge-deferred-no-funding-needed. **176/176 total, no regressions.**
+- **Real blocker found**: the currently-installed live credential has `enableInternalTransfer: false` (from checkpoint 10's real preflight) — even this complete implementation cannot move money until that permission is separately granted.
+- **Explicitly NOT done**: no real transfer attempted, no credential changed, "reserved funds across other strategies" is caller-supplied (defaults to 0 — a real DB-aggregation gap, documented not hidden), no dashboard UI (explicitly deprioritized to protect the demo/submission deadline).
+
 ## Final state
-- **115/115 tests passing**, typecheck clean.
+- **176/176 tests passing**, typecheck clean.
 - 6 commits, all local (`git log --oneline` in the repo) as of Checkpoint 7; Checkpoints 8–11's changes are staged for new commits pending user review. Nothing pushed.
 - Nothing deployed beyond the prior VPS deployment plus 3 read-only preflight files synced at checkpoint 10 (no live-enabled code deployed anywhere). No credentials created by HedgeOS (user rotated and installed their own, outside this session). No live orders. No agreements signed. No funds transferred. Nothing submitted.
 

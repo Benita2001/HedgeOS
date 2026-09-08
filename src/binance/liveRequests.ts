@@ -265,3 +265,68 @@ export function reconcileOrder(requestedQty: number, order: RawOrderResponse, tr
       : `order.executedQty=${orderExecutedQty} but sum(userTrades.qty)=${tradeQty} for orderId ${order.orderId} — treat as unresolved until reconciled`,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Internal Spot<->Futures transfer (POST/GET /sapi/v1/asset/transfer).
+// Verified this session: endpoint paths confirmed against developers.binance.com's
+// Wallet Asset API endpoint list ("User Universal Transfer" / "Query User Universal
+// Transfer History"). The exact `type` enum value and full response schema were
+// NOT independently re-fetched field-by-field this session (the docs site did not
+// render that detail to automated fetches) — MAIN_UMFUTURE / UMFUTURE_MAIN below
+// reflect Binance's long-stable, well-established universal-transfer type naming
+// convention, not a fresh line-by-line doc read. Recommend a final manual doc
+// check before this is ever used against a real account.
+// ---------------------------------------------------------------------------
+
+/** Spot (main) wallet -> USDⓈ-M Futures wallet, the only direction HedgeOS ever needs. */
+export const TRANSFER_TYPE_MAIN_TO_UMFUTURE = "MAIN_UMFUTURE";
+/** The reverse — kept only for completeness/testing, HedgeOS never initiates this direction. */
+export const TRANSFER_TYPE_UMFUTURE_TO_MAIN = "UMFUTURE_MAIN";
+
+export interface RawTransferResponse {
+  tranId: number;
+}
+
+export interface RawTransferHistoryRow {
+  asset: string;
+  amount: string;
+  type: string;
+  status: string; // "CONFIRMED" | "PENDING" | "FAILED", per Binance's documented values
+  tranId: number;
+  timestamp: number;
+}
+
+/**
+ * Requires the `enableInternalTransfer` API-key permission specifically —
+ * distinct from `enableWithdrawals` (never required or requested by this
+ * project) and from `enableSpotAndMarginTrading`/`enableFutures` (trading
+ * permissions, already held by this project's real credential per the
+ * checkpoint-10 preflight). This is the ONE additional narrow permission
+ * automatic funding needs — it does not touch withdrawal capability.
+ */
+export function buildUserUniversalTransferRequest(args: {
+  apiKey: string;
+  apiSecret: string;
+  type: string;
+  asset: string;
+  amount: number;
+  timestamp: number;
+}): SignedRequest {
+  const query = signQueryString({ type: args.type, asset: args.asset, amount: args.amount, timestamp: args.timestamp }, args.apiSecret);
+  return { method: "POST", url: `${SPOT_BASE}/sapi/v1/asset/transfer?${query}`, headers: authHeaders(args.apiKey) };
+}
+
+export function buildTransferHistoryRequest(args: {
+  apiKey: string;
+  apiSecret: string;
+  type: string;
+  startTime?: number;
+  endTime?: number;
+  timestamp: number;
+}): SignedRequest {
+  const params: Record<string, string | number> = { type: args.type, timestamp: args.timestamp };
+  if (args.startTime !== undefined) params.startTime = args.startTime;
+  if (args.endTime !== undefined) params.endTime = args.endTime;
+  const query = signQueryString(params, args.apiSecret);
+  return { method: "GET", url: `${SPOT_BASE}/sapi/v1/asset/transfer?${query}`, headers: authHeaders(args.apiKey) };
+}

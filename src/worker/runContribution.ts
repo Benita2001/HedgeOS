@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { discoverPair } from "../binance/client.js";
-import type { ExecutionAdapter, Fill, SizedLeg } from "../binance/execution.js";
+import type { ExecutionAdapter, Fill, SizedLeg, FundingStepResult } from "../binance/execution.js";
 import { sizeDcaHedgeContribution, sizeHedgeLeg } from "../engine/sizing.js";
 import { assertValidHedgeLeverage } from "../engine/types.js";
 import { getPaperState, type StrategyRow } from "../db/index.js";
@@ -52,6 +52,8 @@ export interface StructuredReceipt {
   stock?: LegReceipt;
   hedge?: HedgeLegReceipt;
   paperState?: ReturnType<typeof getPaperState>;
+  /** Present only in live mode when the hedge leg was executable and the adapter implements prepareFunding (see execution.ts). Undefined for paper mode or a deferred hedge leg. */
+  fundingStep?: FundingStepResult;
 }
 
 /**
@@ -210,6 +212,22 @@ export async function runContribution(
   }
   sizing.hedge = hedgeSizing;
 
+  let fundingStep: FundingStepResult | undefined;
+  if (sizing.hedge.executable && adapter.prepareFunding) {
+    const fundingIdempotencyContext = cycleId !== undefined ? { strategyId: strategy.id, cycleId, leg: "hedge" as const } : undefined;
+    if (fundingIdempotencyContext) {
+      try {
+        fundingStep = await adapter.prepareFunding(sizing, fundingIdempotencyContext);
+      } catch (err) {
+        // A funding-step failure must never silently vanish, but it also must NOT
+        // block the hedge order attempt outright — the hedge leg's own placeOrder
+        // (and Binance's own insufficient-margin rejection) is the authoritative
+        // signal for whether collateral was actually there. Recorded, not swallowed.
+        fundingStep = { attempted: true, plan: undefined, transfer: { tranId: null, requestedAmountUsd: 0, status: "unresolved", reason: `prepareFunding threw: ${(err as Error).message}` } };
+      }
+    }
+  }
+
   let hedgeFill: Fill | undefined;
   if (sizing.hedge.executable) {
     hedgeFill = await placeOrderCapturingThrow(
@@ -236,7 +254,7 @@ export async function runContribution(
       hedge_budget_usd, hedge_leverage, hedge_target_short_notional_usd, hedge_qty,
       hedge_actual_short_notional_usd, hedge_filled_qty, hedge_filled_notional_usd, hedge_order_status,
       hedge_actual_collateral_usd, hedge_fee_usd,
-      hedge_executable, hedge_skip_reason, hedge_deferred_budget_usd, skip_reason
+      hedge_executable, hedge_skip_reason, hedge_deferred_budget_usd, skip_reason, funding_step_json
     ) VALUES (
       @strategyId, @mode, @overallStatus, @contributionUsd, @referencePrice,
       @stockBudgetUsd, @stockQty, @stockNotionalUsd, @stockFilledQty, @stockFilledNotionalUsd,
@@ -244,7 +262,7 @@ export async function runContribution(
       @hedgeBudgetUsd, @hedgeLeverage, @hedgeTargetShortNotionalUsd, @hedgeQty,
       @hedgeActualShortNotionalUsd, @hedgeFilledQty, @hedgeFilledNotionalUsd, @hedgeOrderStatus,
       @hedgeActualCollateralUsd, @hedgeFeeUsd,
-      @hedgeExecutable, @hedgeSkipReason, @hedgeDeferredBudgetUsd, @skipReason
+      @hedgeExecutable, @hedgeSkipReason, @hedgeDeferredBudgetUsd, @skipReason, @fundingStepJson
     )
   `);
 
@@ -280,6 +298,7 @@ export async function runContribution(
       stockRejected || hedgeRejected
         ? `partial cycle failure — stock:${stockOrderStatus}${stockFill?.reason ? ` (${stockFill.reason})` : ""}, hedge:${hedgeOrderStatus}${hedgeFill?.reason ? ` (${hedgeFill.reason})` : ""}`
         : null,
+    fundingStepJson: fundingStep ? JSON.stringify(fundingStep) : null,
   });
   const executionId = execInfo.lastInsertRowid;
 
@@ -376,6 +395,7 @@ export async function runContribution(
         : strategy.deferred_hedge_budget_usd + sizing.hedge.deferredBudgetUsd,
     },
   };
+  if (fundingStep) receipt.fundingStep = fundingStep;
 
   receipt.paperState = getPaperState(db, strategy.id);
   return receipt;

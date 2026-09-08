@@ -30,6 +30,18 @@ function runMigrations(db: Database.Database): void {
     // daily/weekly/monthly calendar cadence," the exact behavior those rows already had.
     db.exec("ALTER TABLE strategies ADD COLUMN interval_minutes INTEGER DEFAULT NULL");
   }
+  if (!columns.some((c) => c.name === "funding_mode")) {
+    // Existing rows get 'prefunded' — identical to their behavior before this column existed
+    // (nothing anywhere in the codebase ever attempted an automatic transfer until this change).
+    db.exec("ALTER TABLE strategies ADD COLUMN funding_mode TEXT NOT NULL DEFAULT 'prefunded'");
+    db.exec("ALTER TABLE strategies ADD COLUMN funding_buffer_usd REAL NOT NULL DEFAULT 0");
+    db.exec("ALTER TABLE strategies ADD COLUMN funding_per_cycle_cap_usd REAL NOT NULL DEFAULT 0");
+    db.exec("ALTER TABLE strategies ADD COLUMN funding_period_cap_usd REAL DEFAULT NULL");
+  }
+  const executionsColumns = db.prepare("PRAGMA table_info(executions)").all() as Array<{ name: string }>;
+  if (!executionsColumns.some((c) => c.name === "funding_step_json")) {
+    db.exec("ALTER TABLE executions ADD COLUMN funding_step_json TEXT DEFAULT NULL");
+  }
 }
 
 export function openDb(path = process.env.HEDGEOS_DB_PATH ?? "./data/hedgeos.db"): Database.Database {
@@ -57,6 +69,10 @@ export interface StrategyRow {
   end_at: string | null;
   /** Whole minutes or null. Null (the default) means "use the daily/weekly/monthly frequency column." Non-null overrides it — generic cadence, e.g. 10 for "every 10 minutes." */
   interval_minutes: number | null;
+  funding_mode: "prefunded" | "auto";
+  funding_buffer_usd: number;
+  funding_per_cycle_cap_usd: number;
+  funding_period_cap_usd: number | null;
 }
 
 /**
@@ -91,6 +107,14 @@ export function createStrategy(
     endAt?: string;
     /** Optional whole-minute cadence override (e.g. 10 for "every 10 minutes"). Omitted/undefined = use `frequency`'s daily/weekly/monthly calendar cadence (unchanged default behavior). Must be >= MIN_INTERVAL_MINUTES. */
     intervalMinutes?: number;
+    /** Funding policy for the hedge leg's collateral. Omitted = 'prefunded' (default, unchanged prior behavior — user tops up Futures themselves). 'auto' additionally requires the separate runtime `assertAutoFundingGate` env-var gate to actually transfer real funds; setting this alone never does. */
+    fundingMode?: "prefunded" | "auto";
+    /** Extra USDT transferred beyond the bare collateral requirement (price-drift/fee buffer). Only meaningful when fundingMode='auto'. Default 0. */
+    fundingBufferUsd?: number;
+    /** Hard per-cycle transfer ceiling. Only meaningful when fundingMode='auto'. Default 0 (i.e. 'auto' with no cap configured transfers nothing — must be set explicitly to enable real transfers). */
+    fundingPerCycleCapUsd?: number;
+    /** Optional rolling-period (e.g. daily) transfer ceiling, independent of the per-cycle cap. */
+    fundingPeriodCapUsd?: number;
   },
 ): StrategyRow {
   const hedgeLeverage = args.hedgeLeverage ?? DEFAULT_HEDGE_LEVERAGE;
@@ -101,10 +125,14 @@ export function createStrategy(
   if (args.intervalMinutes !== undefined) {
     assertValidIntervalMinutes(args.intervalMinutes);
   }
+  const fundingMode = args.fundingMode ?? "prefunded";
+  if (fundingMode === "auto" && (args.fundingPerCycleCapUsd === undefined || args.fundingPerCycleCapUsd <= 0)) {
+    throw new Error(`fundingMode="auto" requires an explicit, positive fundingPerCycleCapUsd — refusing to enable automatic transfers with no configured limit.`);
+  }
 
   const stmt = db.prepare(
-    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at, end_at, interval_minutes)
-     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')), @endAt, @intervalMinutes)`,
+    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at, end_at, interval_minutes, funding_mode, funding_buffer_usd, funding_per_cycle_cap_usd, funding_period_cap_usd)
+     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')), @endAt, @intervalMinutes, @fundingMode, @fundingBufferUsd, @fundingPerCycleCapUsd, @fundingPeriodCapUsd)`,
   );
   const info = stmt.run({
     ticker: args.ticker,
@@ -116,6 +144,10 @@ export function createStrategy(
     firstDueAt: args.firstDueAt ?? null,
     endAt: args.endAt ?? null,
     intervalMinutes: args.intervalMinutes ?? null,
+    fundingMode,
+    fundingBufferUsd: args.fundingBufferUsd ?? 0,
+    fundingPerCycleCapUsd: args.fundingPerCycleCapUsd ?? 0,
+    fundingPeriodCapUsd: args.fundingPeriodCapUsd ?? null,
   });
   return db.prepare("SELECT * FROM strategies WHERE id = ?").get(info.lastInsertRowid) as StrategyRow;
 }

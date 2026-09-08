@@ -1,4 +1,7 @@
-import type { ExecutionAdapter, Fill, SizedLeg, OrderIdempotencyContext } from "./execution.js";
+import type { ExecutionAdapter, Fill, SizedLeg, OrderIdempotencyContext, FundingStepResult } from "./execution.js";
+import type { DcaHedgeSizingResult } from "../engine/types.js";
+import { planFunding, type FundingPolicy } from "./fundingReadiness.js";
+import { assertAutoFundingGate, executeAutoFundingTransfer } from "./fundingTransfer.js";
 import { newClientOrderId } from "./liveSigning.js";
 import {
   buildNewFuturesOrderRequest,
@@ -416,6 +419,13 @@ export class LiveExecutionAdapter implements ExecutionAdapter {
     private readonly creds: LiveCredentials,
     private readonly hedgeLeverage: number,
     private readonly client: LiveHttpClient = new RealLiveHttpClient(),
+    // Defaults to "prefunded" with a zero cap — i.e. automatic funding is
+    // OFF unless the caller explicitly supplies an "auto" policy. This
+    // keeps every pre-existing construction of this class (35 tests, the
+    // real worker/MCP wiring) behaviorally unchanged: no transfer is ever
+    // attempted unless a caller opts in.
+    private readonly fundingPolicy: FundingPolicy = { mode: "prefunded", bufferUsd: 0, perCycleCapUsd: 0 },
+    private readonly reservedFuturesUsd = 0,
   ) {}
 
   /**
@@ -460,5 +470,41 @@ export class LiveExecutionAdapter implements ExecutionAdapter {
 
     const reconciled = await placeAndReconcileSpotOrder(this.client, this.creds, { symbol, side, quantity: leg.quantity, clientOrderId });
     return reconciledToFill(symbol, side, reconciled);
+  }
+
+  /**
+   * Called by `runContribution` before the hedge leg's `placeOrder`, when
+   * the hedge leg is executable. Reads the REAL current Futures balance
+   * (never trusts a cached/stale figure), computes the deterministic
+   * funding plan (`planFunding`), and — only if this adapter's configured
+   * policy is "auto" AND the separate `assertAutoFundingGate` passes —
+   * executes exactly the planned transfer amount. In "prefunded" mode (the
+   * default), this only ever reports the plan; it never calls the transfer
+   * gate or endpoint at all.
+   */
+  async prepareFunding(sizing: DcaHedgeSizingResult, _idempotencyContext: OrderIdempotencyContext): Promise<FundingStepResult> {
+    if (!sizing.hedge.executable) {
+      return { attempted: false, plan: planFunding({ ticker: "", sizing, futuresAvailableUsd: 0, reservedFuturesUsd: this.reservedFuturesUsd, policy: this.fundingPolicy }) };
+    }
+
+    const futuresAccount = await this.client.send<{ availableBalance?: string }>(
+      buildFuturesAccountV3Request({ apiKey: this.creds.apiKey, apiSecret: this.creds.apiSecret, timestamp: Date.now() }),
+    );
+    const futuresAvailableUsd = Number(futuresAccount.availableBalance ?? 0);
+
+    const plan = planFunding({ ticker: "", sizing, futuresAvailableUsd, reservedFuturesUsd: this.reservedFuturesUsd, policy: this.fundingPolicy });
+
+    if (plan.action !== "transfer_required" && plan.action !== "capped_still_insufficient") {
+      return { attempted: false, plan };
+    }
+    if (plan.transferAmountUsd <= 0) {
+      return { attempted: false, plan };
+    }
+
+    // Separate, independent fail-closed gate from live-trading itself — throws if not explicitly authorized.
+    assertAutoFundingGate();
+
+    const transfer = await executeAutoFundingTransfer(this.client, this.creds, { asset: "USDT", amountUsd: plan.transferAmountUsd });
+    return { attempted: true, plan, transfer };
   }
 }

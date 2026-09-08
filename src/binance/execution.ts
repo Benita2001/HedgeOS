@@ -1,3 +1,7 @@
+import type { DcaHedgeSizingResult } from "../engine/types.js";
+import type { FundingPlan } from "./fundingReadiness.js";
+import type { TransferReceipt } from "./fundingTransfer.js";
+
 function round(n: number, decimals = 0): number {
   const factor = 10 ** decimals;
   return Math.round(n * factor) / factor;
@@ -32,6 +36,12 @@ export interface OrderIdempotencyContext {
   leg: "stock" | "hedge";
 }
 
+export interface FundingStepResult {
+  attempted: boolean;
+  plan?: FundingPlan;
+  transfer?: TransferReceipt;
+}
+
 export interface ExecutionAdapter {
   mode: "paper" | "live";
   /**
@@ -42,6 +52,17 @@ export interface ExecutionAdapter {
    * `liveExecution.ts`.
    */
   placeOrder(symbol: string, side: "BUY" | "SELL", leg: SizedLeg, referencePrice: number, idempotencyContext?: OrderIdempotencyContext): Promise<Fill>;
+  /**
+   * Optional pre-hedge-leg step: checks whether the hedge leg's collateral
+   * requirement is covered and, if the account's funding policy is "auto"
+   * AND the separate `assertAutoFundingGate` passes, executes exactly the
+   * planned Spot->Futures transfer amount (see `fundingReadiness.ts` /
+   * `fundingTransfer.ts`) — never a guess, never the full account balance.
+   * `PaperExecutionAdapter` does not implement this (no real wallets to
+   * fund); `LiveExecutionAdapter` does. Called by `runContribution` before
+   * the hedge leg's `placeOrder`, when present.
+   */
+  prepareFunding?(sizing: DcaHedgeSizingResult, idempotencyContext: OrderIdempotencyContext): Promise<FundingStepResult>;
 }
 
 /**
