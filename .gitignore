@@ -1,4 +1,7 @@
 node_modules/
+# Third-party Skills Hub packages installed via `npx skills add` — vendor tree, not this project's
+# code; fully reproducible from the install commands in docs/BINANCE_SKILLS_HUB_ASSESSMENT.md.
+.agents/
 dist/
 *.log
 .env
