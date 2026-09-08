@@ -44,6 +44,9 @@ function runMigrations(db: Database.Database): void {
     db.exec("ALTER TABLE strategies ADD COLUMN mode TEXT NOT NULL DEFAULT 'paper'");
     db.exec("ALTER TABLE strategies ADD COLUMN capital_limit_usd REAL DEFAULT NULL");
   }
+  if (!columns.some((c) => c.name === "live_authorized_at")) {
+    db.exec("ALTER TABLE strategies ADD COLUMN live_authorized_at TEXT DEFAULT NULL");
+  }
   const executionsColumns = db.prepare("PRAGMA table_info(executions)").all() as Array<{ name: string }>;
   if (!executionsColumns.some((c) => c.name === "funding_step_json")) {
     db.exec("ALTER TABLE executions ADD COLUMN funding_step_json TEXT DEFAULT NULL");
@@ -187,6 +190,29 @@ export interface StrategyRow {
   mode: "paper" | "live";
   /** Total lifetime capital cap for a 'live' strategy. Required (and enforced by createStrategy) when mode='live'; null for paper. */
   capital_limit_usd: number | null;
+  /** NULL = draft/unauthorized (worker will never auto-execute). Set by authorize_live_strategy. */
+  live_authorized_at: string | null;
+}
+
+/** Sums the real USDT actually committed by a live strategy's completed/partial executions — stock notional actually filled plus hedge collateral actually posted. This, not the requested/budgeted amounts, is what's compared against capital_limit_usd before another cycle may run. */
+export function getLiveCapitalSpentUsd(db: Database.Database, strategyId: number): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(stock_filled_notional_usd), 0) + COALESCE(SUM(CASE WHEN hedge_order_status IN ('filled','partially_filled') THEN hedge_actual_collateral_usd ELSE 0 END), 0) AS spent
+       FROM executions WHERE strategy_id = ? AND mode = 'live'`,
+    )
+    .get(strategyId) as { spent: number };
+  return Math.round(row.spent * 100) / 100;
+}
+
+/** The explicit, separate second step that turns a draft live strategy into one the worker may actually execute. Re-confirms (does not change) capitalLimitUsd/endAt so the caller can verify they're authorizing what they think they're authorizing. */
+export function authorizeLiveStrategy(db: Database.Database, strategyId: number): StrategyRow | undefined {
+  const strategy = getStrategy(db, strategyId);
+  if (!strategy) return undefined;
+  if (strategy.mode !== "live") throw new Error(`strategy ${strategyId} is mode='${strategy.mode}', not 'live' — only live strategies can be authorized`);
+  if (strategy.live_authorized_at) throw new Error(`strategy ${strategyId} is already authorized (at ${strategy.live_authorized_at}) — re-authorization is not needed; pause/resume or create a new strategy for a new authorization`);
+  db.prepare("UPDATE strategies SET live_authorized_at = datetime('now') WHERE id = ?").run(strategyId);
+  return getStrategy(db, strategyId);
 }
 
 /**

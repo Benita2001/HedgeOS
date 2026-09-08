@@ -1,5 +1,5 @@
-import { openDb, listActiveStrategies, getStrategy } from "../db/index.js";
-import { getExecutionAdapter } from "../binance/execution.js";
+import { openDb, listActiveStrategies, getStrategy, getLiveCapitalSpentUsd, hasScheduleEnded } from "../db/index.js";
+import { getExecutionAdapter, type ExecutionAdapter } from "../binance/execution.js";
 import {
   ensureDueCycles,
   getPendingAndRetryableCycles,
@@ -73,12 +73,45 @@ export async function startWorker() {
           continue;
         }
         if (strategy.mode === "live") {
-          // The passive worker NEVER auto-executes a live-mode strategy's cycle — that
-          // requires an explicit, separately-gated trigger_live_cycle call. Un-claim it
-          // (revert to pending) so it stays available for that manual action rather than
-          // sitting claimed-but-never-processed.
-          db.prepare("UPDATE cycles SET status = 'pending' WHERE id = ?").run(claimed.id);
-          log(`cycle #${claimed.id} (strategy ${strategy.id}, LIVE mode) left pending — the passive worker does not auto-execute live strategies; use trigger_live_cycle explicitly`);
+          const revert = (reason: string) => {
+            db.prepare("UPDATE cycles SET status = 'pending' WHERE id = ?").run(claimed.id);
+            log(`cycle #${claimed.id} (strategy ${strategy.id}, LIVE mode) left pending — ${reason}`);
+          };
+          // Every one of these is re-checked HERE, at execution time, not just at cycle-creation
+          // time — authorization, pausing, or capital exhaustion can all happen after a due cycle
+          // row already exists. A paused, expired, exhausted-capital, or unauthorized strategy
+          // must never place an order, regardless of when its cycle was created.
+          if (!strategy.live_authorized_at) {
+            revert("not yet authorized (authorize_live_strategy has not been called for this strategy)");
+            continue;
+          }
+          if (hasScheduleEnded(strategy)) {
+            revert("schedule has ended (past its authorized endAt) — no further cycles will run");
+            continue;
+          }
+          if (strategy.capital_limit_usd !== null) {
+            const spent = getLiveCapitalSpentUsd(db, strategy.id);
+            if (spent >= strategy.capital_limit_usd) {
+              revert(`capital limit exhausted ($${spent} spent of $${strategy.capital_limit_usd} limit) — no further cycles will run`);
+              continue;
+            }
+          }
+          let liveAdapter: ExecutionAdapter;
+          try {
+            const { assertLiveTradingGate, LiveExecutionAdapter } = await import("../binance/liveExecution.js");
+            const creds = assertLiveTradingGate();
+            liveAdapter = new LiveExecutionAdapter(creds, strategy.hedge_leverage);
+          } catch (err) {
+            revert(`live-trading environment gate not satisfied in this worker process: ${(err as Error).message}`);
+            continue;
+          }
+          log(`cycle #${claimed.id} claimed: strategy ${strategy.id} (${strategy.ticker}) slot ${claimed.scheduled_for} — LIVE, authorized, gate satisfied — executing for real`);
+          try {
+            const receipt = await processCycle(db, claimed, strategy, liveAdapter);
+            log(`cycle #${claimed.id} -> ${receipt.status} (mode=${receipt.mode}, simulated=${receipt.simulated}) [REAL EXECUTION]`);
+          } catch (err) {
+            log(`LIVE cycle #${claimed.id} failed: ${(err as Error).message}`);
+          }
           continue;
         }
         log(`cycle #${claimed.id} claimed: strategy ${strategy.id} (${strategy.ticker}) slot ${claimed.scheduled_for}`);

@@ -14,6 +14,8 @@ import {
   getPaperState,
   getLatestExecution,
   hasScheduleEnded,
+  authorizeLiveStrategy,
+  getLiveCapitalSpentUsd,
 } from "../db/index.js";
 import { ALLOWED_HEDGE_LEVERAGES, DEFAULT_HEDGE_LEVERAGE } from "../engine/types.js";
 import { evaluateRiskAlerts, type LatestExecutionSummary } from "../risk/checks.js";
@@ -83,6 +85,7 @@ server.registerTool(
     return textResult({
       strategy,
       scheduleEnded: hasScheduleEnded(strategy),
+      liveCapitalSpentUsd: strategy.mode === "live" ? getLiveCapitalSpentUsd(db, strategyId) : undefined,
       paperState,
       riskAlerts,
     });
@@ -423,10 +426,36 @@ server.registerTool(
       return textResult({
         created: strategy,
         note:
-          `LIVE-MODE STRATEGY CREATED — NO ORDER HAS BEEN PLACED, NO FUNDS TRANSFERRED. ` +
-          `Capital limit $${capitalLimitUsd} over its lifetime, ends ${endAt}. The passive worker will never auto-execute this — ` +
-          `each cycle needs an explicit trigger_live_cycle call, which independently requires the full live-trading environment gate to be set. ` +
-          `Funding policy: ${fundingMode}${fundingMode === "auto" ? ` (up to $${fundingPerCycleCapUsd}/cycle automatic transfer, requires its own separate HEDGEOS_FUNDING_MODE/HEDGEOS_AUTO_FUNDING_CONFIRMED gate too)` : " — you fund the Futures wallet yourself"}.`,
+          `LIVE-MODE STRATEGY CREATED — DRAFT, NOT YET AUTHORIZED. NO ORDER HAS BEEN PLACED, NO FUNDS TRANSFERRED. ` +
+          `Capital limit $${capitalLimitUsd} over its lifetime, ends ${endAt}. The passive worker will NOT auto-execute this until you call authorize_live_strategy — ` +
+          `a required, separate, explicit second step. Even once authorized, every due cycle also independently requires the full live-trading environment gate to be set on the worker process, or it's reverted to pending, not executed. ` +
+          `Funding policy: ${fundingMode}${fundingMode === "auto" ? ` (up to $${fundingPerCycleCapUsd}/cycle automatic transfer, requires its own separate HEDGEOS_FUNDING_MODE/HEDGEOS_AUTO_FUNDING_CONFIRMED gate too)` : " — you fund the Futures wallet yourself"}. ` +
+          `You can still use trigger_live_cycle for a single one-off manual cycle without authorizing autonomous recurrence at all.`,
+      });
+    } catch (err) {
+      return errorResult((err as Error).message);
+    }
+  },
+);
+
+server.registerTool(
+  "authorize_live_strategy",
+  {
+    title: "Authorize a draft live strategy for autonomous recurring execution",
+    description:
+      "The required, separate, explicit second step (after create_live_strategy) that allows the PASSIVE WORKER to actually auto-execute this strategy's due cycles going forward — without this, the strategy exists but the worker leaves every due cycle pending forever. Does not itself place any order. Re-states the strategy's capitalLimitUsd/endAt back to you so you can verify what you're authorizing before confirming. Cannot be called twice for the same strategy (re-authorization is refused, not silently accepted). Even after authorization, every cycle still independently requires the worker process's own live-trading environment gate (BINANCE_API_KEY/SECRET + HEDGEOS_MODE=live + HEDGEOS_LIVE_TRADING_CONFIRMED + HEDGEOS_LIVE_CHECKLIST_COMPLETE) — authorizing here does not set that gate.",
+    inputSchema: { strategyId: z.number().int().positive() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  async ({ strategyId }) => {
+    try {
+      const before = getStrategy(db, strategyId);
+      if (!before) return errorResult(`no strategy with id ${strategyId}`);
+      const after = authorizeLiveStrategy(db, strategyId);
+      return textResult({
+        authorized: true,
+        strategy: after,
+        note: `Strategy ${strategyId} (${before.ticker}) is now authorized for autonomous live execution: capital limit $${before.capital_limit_usd}, ends ${before.end_at}, contribution $${before.contribution_usd}/cycle at ${before.hedge_leverage}x. The worker will attempt real cycles as they come due, PROVIDED the live-trading environment gate is also set on that process — it is a separate, independent check, re-verified every cycle. Pause the strategy (pause_strategy) at any time to stop this.`,
       });
     } catch (err) {
       return errorResult((err as Error).message);

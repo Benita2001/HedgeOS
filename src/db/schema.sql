@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS strategies (
   -- Total lifetime capital cap for a 'live' strategy (distinct from per-cycle contribution_usd) —
   -- required and enforced only when mode='live'; NULL for paper strategies.
   capital_limit_usd REAL DEFAULT NULL,
+  -- NULL = draft (created but not authorized — the worker will never auto-execute it,
+  -- regardless of status/mode). Set (an ISO timestamp) by the SEPARATE authorize_live_strategy
+  -- MCP call = authorized. This is what turns "a live strategy exists" into "the worker may
+  -- actually place real orders for it" — deliberately a second, explicit step from creation,
+  -- never implied by create_live_strategy alone. Irrelevant for mode='paper' (always NULL).
+  live_authorized_at TEXT DEFAULT NULL,
   -- Optional ISO timestamp: the scheduler creates no new cycle whose scheduled_for is after this
   -- (a cycle scheduled exactly at end_at is still created — inclusive boundary). NULL (the default,
   -- and the only value every strategy created before this column existed has) means "runs
