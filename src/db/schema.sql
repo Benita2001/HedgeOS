@@ -9,7 +9,13 @@ CREATE TABLE IF NOT EXISTS strategies (
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
   next_due_at TEXT NOT NULL DEFAULT (datetime('now')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  deferred_hedge_budget_usd REAL NOT NULL DEFAULT 0
+  deferred_hedge_budget_usd REAL NOT NULL DEFAULT 0,
+  -- Optional ISO timestamp: the scheduler creates no new cycle whose scheduled_for is after this
+  -- (a cycle scheduled exactly at end_at is still created — inclusive boundary). NULL (the default,
+  -- and the only value every strategy created before this column existed has) means "runs
+  -- indefinitely" — the exact prior behavior, unchanged. Ending a schedule never touches positions,
+  -- executions, or receipts; it only stops new cycles from being created.
+  end_at TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS executions (

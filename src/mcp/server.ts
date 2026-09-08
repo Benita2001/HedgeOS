@@ -13,6 +13,7 @@ import {
   listReceipts,
   getPaperState,
   getLatestExecution,
+  hasScheduleEnded,
 } from "../db/index.js";
 import { ALLOWED_HEDGE_LEVERAGES, DEFAULT_HEDGE_LEVERAGE } from "../engine/types.js";
 import { evaluateRiskAlerts, type LatestExecutionSummary } from "../risk/checks.js";
@@ -78,7 +79,12 @@ server.registerTool(
     const paperState = getPaperState(db, strategyId);
     const latest = getLatestExecution(db, strategyId) as unknown as LatestExecutionSummary | undefined;
     const riskAlerts = evaluateRiskAlerts(strategy, paperState, latest);
-    return textResult({ strategy, paperState, riskAlerts });
+    return textResult({
+      strategy,
+      scheduleEnded: hasScheduleEnded(strategy),
+      paperState,
+      riskAlerts,
+    });
   },
 );
 
@@ -243,7 +249,7 @@ server.registerTool(
   {
     title: "Create a paper strategy",
     description:
-      "Creates a new HedgeOS strategy in paper mode: 90% of each contribution buys the bStock, 10% is the hedge collateral budget at the given leverage (2x default, 3x optional, nothing higher). Does not place any order — the first contribution runs on the strategy's own schedule via the persistent worker, or can be triggered manually with trigger_due_cycle.",
+      "Creates a new HedgeOS strategy in paper mode: 90% of each contribution buys the bStock, 10% is the hedge collateral budget at the given leverage (2x default, 3x optional, nothing higher). Does not place any order — the first contribution runs on the strategy's own schedule via the persistent worker, or can be triggered manually with trigger_due_cycle. Optional endAt (ISO timestamp): if the user said something like 'for six months', compute the concrete end date yourself (now + 6 months) and pass it here — HedgeOS enforces it deterministically (no new cycle is ever scheduled after it; a cycle due exactly on it still runs) but never guesses a duration from vague language on its own. Omit endAt for a strategy that runs indefinitely (the default, unchanged behavior).",
     inputSchema: {
       ticker: z.string().min(1),
       contributionUsd: z.number().positive(),
@@ -251,20 +257,31 @@ server.registerTool(
       hedgeLeverage: z.number().refine((n) => (ALLOWED_HEDGE_LEVERAGES as readonly number[]).includes(n), {
         message: `hedgeLeverage must be one of ${ALLOWED_HEDGE_LEVERAGES.join(", ")}`,
       }).default(DEFAULT_HEDGE_LEVERAGE),
+      endAt: z.string().datetime().optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   },
-  async ({ ticker, contributionUsd, frequency, hedgeLeverage }) => {
+  async ({ ticker, contributionUsd, frequency, hedgeLeverage, endAt }) => {
     const upper = ticker.toUpperCase();
-    const strategy = createStrategy(db, {
-      ticker: upper,
-      spotSymbol: `${upper}BUSDT`,
-      futuresSymbol: `${upper}USDT`,
-      contributionUsd,
-      frequency,
-      hedgeLeverage,
-    });
-    return textResult({ created: strategy, note: "Paper mode. No order has been placed. The instrument pair will be (re-)validated at each contribution via live discovery." });
+    try {
+      const strategy = createStrategy(db, {
+        ticker: upper,
+        spotSymbol: `${upper}BUSDT`,
+        futuresSymbol: `${upper}USDT`,
+        contributionUsd,
+        frequency,
+        hedgeLeverage,
+        endAt,
+      });
+      return textResult({
+        created: strategy,
+        note:
+          "Paper mode. No order has been placed. The instrument pair will be (re-)validated at each contribution via live discovery." +
+          (endAt ? ` Schedule ends ${endAt} (inclusive) — no new contribution will be created after that date; accumulated positions are never auto-liquidated when a schedule ends.` : " Runs indefinitely (no endAt given) — pause it yourself when you're done."),
+      });
+    } catch (err) {
+      return errorResult((err as Error).message);
+    }
   },
 );
 

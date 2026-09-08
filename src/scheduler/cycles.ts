@@ -38,11 +38,21 @@ export function ensureDueCycles(db: Database.Database, strategy: StrategyRow, no
   let dueAt = new Date(strategy.next_due_at.replace(" ", "T") + (strategy.next_due_at.endsWith("Z") ? "" : "Z"));
   let count = 0;
 
+  // Inclusive boundary: a cycle scheduled exactly at end_at still runs (e.g.
+  // "every week for six months" includes the contribution due on the
+  // six-month mark itself). A cycle scheduled after end_at is never
+  // created — checked per-iteration below, so this also correctly bounds
+  // missed-cycle catch-up near the end date (never catches up PAST it) and
+  // is unaffected by pause/resume (a paused strategy isn't ticked at all —
+  // see listActiveStrategies) or by restart (reconcileInProgressCycles
+  // only resolves already-created cycles, it never creates new ones).
+  const endAt = strategy.end_at ? new Date(strategy.end_at) : null;
+
   const insert = db.prepare(
     `INSERT OR IGNORE INTO cycles (strategy_id, scheduled_for, idempotency_key) VALUES (?, ?, ?)`,
   );
 
-  while (dueAt.getTime() <= now.getTime() && count < MAX_CATCHUP_CYCLES) {
+  while (dueAt.getTime() <= now.getTime() && count < MAX_CATCHUP_CYCLES && (!endAt || dueAt.getTime() <= endAt.getTime())) {
     const scheduledForIso = dueAt.toISOString();
     const idempotencyKey = `${strategy.id}:${scheduledForIso}`;
     const info = insert.run(strategy.id, scheduledForIso, idempotencyKey);

@@ -7,7 +7,7 @@ This is the reusable instruction set for an AI coding agent (or a human) operati
 | Client | Status | How |
 |---|---|---|
 | **Claude Code** | **Tested, working.** Real end-to-end evidence: `scripts/mcp-smoke-test.ts` (spawns the actual server, drives it as a real MCP client) and this project's own build sessions, which used exactly this connection. | `claude mcp add hedgeos --transport stdio -- npx tsx src/mcp/server.ts` — see `docs/MCP_SETUP.md` |
-| **Codex CLI** | **Documented, NOT verified in this project.** HedgeOS's MCP server is a standard `@modelcontextprotocol/sdk` stdio server with no Claude-specific behavior, and Codex CLI's own documentation describes stdio MCP server support via a `[mcp_servers.*]` block in `~/.codex/config.toml` — the connection mechanics are the same to a standards-compliant server. **No Codex session has actually been run against this server in this repository's history.** Treat the config below as a starting point to test, not a proven-working recipe, until someone actually runs it and the result is logged. | See "Codex setup" below |
+| **Codex CLI** | **Tested, working — verified 2026-09-08.** `codex mcp add hedgeos --env HEDGEOS_MODE=paper --env HEDGEOS_DB_PATH=<abs path> -- npx tsx <abs path>/src/mcp/server.ts`, then `codex exec -s read-only -C <repo>` with a prompt calling `list_strategies` and `get_strategy_status` — real session id `01a0824a-e323-7631-be0c-c5ad5937e245`, both tools returned correct real data (a seeded NVDA strategy, its `scheduleEnded`/`paperState`/`riskAlerts`). No HedgeOS-specific behavior was needed — it's a standard stdio MCP server. | See "Codex setup" below |
 | Any other MCP-capable client | Should work the same way (stdio transport, standard tool-call semantics) — genuinely untested here, same caveat as Codex. | Point it at `npx tsx src/mcp/server.ts` (or a remote form, see `docs/MCP_SETUP.md`'s SSH-spawn pattern) |
 
 ### Claude Code setup (verified)
@@ -16,16 +16,19 @@ claude mcp add hedgeos --transport stdio -- npx tsx src/mcp/server.ts
 ```
 Then `/mcp` in that session and select `hedgeos`. Full detail, including remote-over-SSH: `docs/MCP_SETUP.md`.
 
-### Codex setup (documented, unverified — test before relying on it)
-Add to `~/.codex/config.toml`:
-```toml
-[mcp_servers.hedgeos]
-command = "npx"
-args = ["tsx", "src/mcp/server.ts"]
-cwd = "/path/to/your/HedgeOS/checkout"
-env = { HEDGEOS_DB_PATH = "./data/hedgeos.db", HEDGEOS_MODE = "paper" }
+### Codex setup (verified working)
+Use Codex's own CLI (`codex mcp add`) rather than hand-editing `~/.codex/config.toml` — it has no `--cwd` flag, so pass **absolute paths** everywhere:
+```bash
+codex mcp add hedgeos \
+  --env HEDGEOS_MODE=paper \
+  --env HEDGEOS_DB_PATH=/absolute/path/to/HedgeOS/data/hedgeos.db \
+  -- npx tsx /absolute/path/to/HedgeOS/src/mcp/server.ts
 ```
-Adjust `cwd` to your actual checkout path — there is nothing HedgeOS-specific to configure beyond that. If you run this and it works (or doesn't), please record the result in `PROGRESS_LOG.md` so this status line stops being a guess.
+Then, non-interactively:
+```bash
+codex exec -s read-only -C /absolute/path/to/HedgeOS "Use the 'hedgeos' MCP server's list_strategies tool..."
+```
+or in an interactive `codex` session, same as any other configured MCP server. `codex mcp remove hedgeos` to undo.
 
 ## Tool inventory (all HedgeOS-owned, see `src/mcp/server.ts` for the source of truth)
 
@@ -44,11 +47,11 @@ A user says something like: **"Invest $250 in Apple every week for six months."*
 
 The operator (you, running in Claude Code/Codex/etc.) should:
 
-1. **Extract the structured fields**: ticker (`AAPL`), contribution (`$250`), frequency (`weekly` — HedgeOS supports `daily`/`weekly`/`monthly` only; reject or ask for clarification on anything else), leverage (unstated → default `2x`, per policy). **"For six months" has no field to hold it** — HedgeOS's schema (`strategies` table) has no end-date/duration/cycle-count column. **Say so explicitly to the user** rather than silently dropping it or pretending it's enforced: "HedgeOS will run this weekly until you pause it — there's no built-in auto-stop after 6 months yet, so you'll need to pause it yourself (or ask me to) around that time." Do not fabricate a duration field or promise automatic expiry.
+1. **Extract the structured fields**: ticker (`AAPL`), contribution (`$250`), frequency (`weekly` — HedgeOS supports `daily`/`weekly`/`monthly` only; reject or ask for clarification on anything else), leverage (unstated → default `2x`, per policy), and duration. **"For six months" maps to `create_paper_strategy`'s optional `endAt` field** (`strategies.end_at` in the schema, added and migration-tested this session): compute the concrete ISO date yourself (now + 6 months) and pass it as `endAt` — **HedgeOS enforces the resulting date deterministically** (the scheduler creates no cycle scheduled after it; a cycle due exactly on it still runs), it does not interpret "six months" itself. State the concrete date back to the user so they can sanity-check your interpretation ("...running through 2027-03-08"). Omitting `endAt` means the strategy runs indefinitely until manually paused — still fully supported, still the default.
 2. **Call `preview_strategy`** (or `preview_with_agent_os_observations` if you have a live Binance Agent OS MCP connection this session and want to show corroborating evidence) with the extracted `ticker`/`contributionUsd`/`hedgeLeverage`. This runs real live discovery — it will tell you plainly if `AAPL` doesn't have both a matching bStock and TradFi perpetual (no proxy is ever substituted).
 3. **Optionally call `check_funding_readiness`** with the same inputs if the operator's account credentials are configured — surface any shortfall now, before the user commits to a schedule they can't fund.
 4. **Present a structured proposal back to the user and get explicit confirmation** before doing anything state-changing. Example:
-   > "Proposed: AAPL, $250/week, 2× hedge leverage (default). Preview shows $225 → AAPL stock, $25 → hedge collateral (target $50 short notional). No end date is enforced — you'll need to pause this yourself when you're done. Confirm to activate?"
+   > "Proposed: AAPL, $250/week, 2× hedge leverage (default), running through 2027-03-08 (six months from today). Preview shows $225 → AAPL stock, $25 → hedge collateral (target $50 short notional). The last contribution will be on or just before that date; no new one after. Confirm to activate?"
 5. **Only after explicit confirmation**, call `create_paper_strategy` (in paper mode — this is always paper unless the separate, much more involved live-trading gate in `LIVE_TRADING_READINESS.md` has been deliberately passed by the account owner).
 6. Report back the created strategy's `id`, and mention `get_strategy_status` / `list_receipts` as how to check on it later.
 

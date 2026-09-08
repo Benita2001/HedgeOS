@@ -6,11 +6,31 @@ import { assertValidHedgeLeverage, DEFAULT_HEDGE_LEVERAGE } from "../engine/type
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Additive, backward-compatible migrations for databases created before a
+ * column existed. `CREATE TABLE IF NOT EXISTS` (schema.sql) only affects
+ * brand-new databases — an already-existing `strategies` table (this
+ * project's local dev DB, the deployed VPS DB, anyone's existing install)
+ * needs an explicit `ALTER TABLE ADD COLUMN` to pick up a new column.
+ * Every migration here must be a no-op on a DB that already has the
+ * column, and must never touch existing rows' data.
+ */
+function runMigrations(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(strategies)").all() as Array<{ name: string }>;
+  const hasEndAt = columns.some((c) => c.name === "end_at");
+  if (!hasEndAt) {
+    // Nullable, no default beyond NULL — every existing row gets end_at=NULL,
+    // which means "runs indefinitely," the exact behavior those rows already had.
+    db.exec("ALTER TABLE strategies ADD COLUMN end_at TEXT DEFAULT NULL");
+  }
+}
+
 export function openDb(path = process.env.HEDGEOS_DB_PATH ?? "./data/hedgeos.db"): Database.Database {
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
   const schema = readFileSync(join(__dirname, "schema.sql"), "utf-8");
   db.exec(schema);
+  runMigrations(db);
   return db;
 }
 
@@ -26,6 +46,25 @@ export interface StrategyRow {
   next_due_at: string;
   created_at: string;
   deferred_hedge_budget_usd: number;
+  /** ISO timestamp or null. Null (the default, and every pre-existing strategy's value) means "runs indefinitely." */
+  end_at: string | null;
+}
+
+/**
+ * True once the strategy's schedule has genuinely ended — its next
+ * occurrence would fall after `end_at`, so the scheduler will create no
+ * further cycles for it. This is a derived fact, not a stored status: a
+ * strategy with an ended schedule stays `status: 'active'` in the DB
+ * (never auto-transitioned to any other state, and never triggers
+ * liquidation of accumulated positions) — this function exists so
+ * operators/UIs can surface "this schedule is done" without needing a new
+ * status value or a schema CHECK-constraint migration.
+ */
+export function hasScheduleEnded(strategy: Pick<StrategyRow, "next_due_at" | "end_at">, now: Date = new Date()): boolean {
+  if (!strategy.end_at) return false;
+  const next = new Date(strategy.next_due_at.replace(" ", "T") + (strategy.next_due_at.endsWith("Z") ? "" : "Z"));
+  const end = new Date(strategy.end_at);
+  return next.getTime() > end.getTime();
 }
 
 export function createStrategy(
@@ -39,14 +78,19 @@ export function createStrategy(
     hedgeLeverage?: number;
     /** ISO timestamp of the first due contribution. Defaults to now (due immediately) — mainly for demo/testing. */
     firstDueAt?: string;
+    /** Optional ISO timestamp. Omitted/undefined = runs indefinitely (unchanged default behavior). The caller (an AI operator interpreting "for six months," or a human) is responsible for turning a duration into a concrete date — HedgeOS itself never guesses a duration from vague language. */
+    endAt?: string;
   },
 ): StrategyRow {
   const hedgeLeverage = args.hedgeLeverage ?? DEFAULT_HEDGE_LEVERAGE;
   assertValidHedgeLeverage(hedgeLeverage);
+  if (args.endAt !== undefined && Number.isNaN(new Date(args.endAt).getTime())) {
+    throw new Error(`endAt "${args.endAt}" is not a valid ISO timestamp`);
+  }
 
   const stmt = db.prepare(
-    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at)
-     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')))`,
+    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at, end_at)
+     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')), @endAt)`,
   );
   const info = stmt.run({
     ticker: args.ticker,
@@ -56,6 +100,7 @@ export function createStrategy(
     frequency: args.frequency,
     hedgeLeverage,
     firstDueAt: args.firstDueAt ?? null,
+    endAt: args.endAt ?? null,
   });
   return db.prepare("SELECT * FROM strategies WHERE id = ?").get(info.lastInsertRowid) as StrategyRow;
 }

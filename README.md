@@ -14,7 +14,7 @@ Built for the Binance Agent OS Mini Hackathon (Track A).
 | Paper execution (partial-fill/rejection modeling) | ✅ **Real, tested.** Every paper fill is explicitly labeled `simulated`. |
 | Binance Agent OS MCP integration | ✅ **Real, verified with actual tool calls this session** — operator-side evidence layer, session-bound (no headless auth exists for it). See `docs/AGENT_OS_OPERATOR_WORKFLOW.md`. |
 | HedgeOS's own MCP server (Claude Code) | ✅ **Real, smoke-tested end-to-end** against the actual server subprocess. |
-| HedgeOS's own MCP server (Codex, other clients) | ⚠️ **Documented, not verified.** Standards-compliant stdio MCP server; no Codex session has actually connected to it in this project. See `docs/OPERATOR_GUIDE.md`. |
+| HedgeOS's own MCP server (Codex) | ✅ **Tested, working — verified 2026-09-08.** Real `codex exec` session, real MCP tool calls (`list_strategies`, `get_strategy_status`), real correct results. See `docs/OPERATOR_GUIDE.md`. |
 | Live-execution adapter (real signing, order placement, reconciliation) | ✅ **Real code, mock-tested (28+ tests against a fake HTTP client, zero real network calls).** Fail-closed behind a 4-condition gate that nothing in this repo sets. **No real order has ever been placed.** |
 | Real authenticated preflight against a live account | ✅ **Actually run once, this session**, against the founder's own real (rotated, least-privilege) key — 10/10 read-only checks passed. See `LIVE_TRADING_READINESS.md`. |
 | Live orders | ❌ **Never placed.** Blocked on funding ($0 in both wallets as of the last check) and your explicit per-order authorization. |
@@ -22,7 +22,7 @@ Built for the Binance Agent OS Mini Hackathon (Track A).
 | Automatic inter-wallet transfer | ❌ **Not built.** Documented requirements for a future version in `docs/FUNDING_READINESS.md`. |
 | Self-hosted install for a second, independent user | ✅ **Deploy tooling is generic** (parameterized by `HEDGEOS_DEPLOY_HOST`, no hardcoded IP/paths — verified by grep this session). `docs/SELF_HOSTED_INSTALL.md`. |
 | Multi-tenant hosting (many users, one shared instance) | ❌ **Not built.** Architecture documented in `docs/MULTI_TENANT_ARCHITECTURE.md` — explicitly a design sketch, not a claim of implementation. |
-| Natural-language strategy proposals | ⚠️ **Workflow documented for the operating AI client** (`docs/OPERATOR_GUIDE.md`); the AI extracts intent and proposes, the user confirms, and only the deterministic engine computes money math. This is interactive AI orchestration around a deterministic core — not independent LLM reasoning about trading decisions, and not itself a new autonomous capability. |
+| Natural-language strategy proposals, including finite duration ("...for six months") | ✅ **Workflow documented** (`docs/OPERATOR_GUIDE.md`) and **duration enforcement is real and tested**: `strategies.end_at` (optional, migration-tested against a pre-existing database), enforced deterministically by the scheduler (`ensureDueCycles`) — no cycle is ever created past it, missed-cycle catch-up near the boundary is correctly capped, and a schedule ending never touches accumulated positions. The AI extracts intent and computes the concrete end date; only the deterministic engine enforces it — not independent LLM reasoning about trading decisions. |
 
 Full evidence, checkpoint by checkpoint: `PROGRESS_LOG.md`.
 
@@ -63,7 +63,8 @@ src/
                  discovery — evidence only, never a sizing input (src/observations/externalObservation.ts)
   db/           SQLite schema + access (strategies, executions, receipts, cycles) — single-tenant today
   scheduler/    cadence math + idempotent due-cycle lifecycle (pending -> in_progress -> completed/
-                failed_retryable/failed_terminal), crash recovery
+                failed_retryable/failed_terminal), crash recovery, optional end_at enforcement
+                (no cycle created past it, inclusive boundary, missed-cycle catch-up correctly capped)
   worker/       runContribution.ts (observe -> decide -> act -> verify, one contribution) +
                 index.ts (the actual persistent process: reconciles on boot, ticks on an interval)
   risk/         deterministic risk alerts (missing hedge exposure, stale schedule, reconciliation
@@ -76,7 +77,7 @@ src/
 
 ```bash
 npm install
-npm test              # 120 tests
+npm test              # 133 tests
 npx tsc --noEmit       # typecheck
 ```
 
