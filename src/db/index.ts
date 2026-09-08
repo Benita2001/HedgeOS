@@ -38,6 +38,12 @@ function runMigrations(db: Database.Database): void {
     db.exec("ALTER TABLE strategies ADD COLUMN funding_per_cycle_cap_usd REAL NOT NULL DEFAULT 0");
     db.exec("ALTER TABLE strategies ADD COLUMN funding_period_cap_usd REAL DEFAULT NULL");
   }
+  if (!columns.some((c) => c.name === "mode")) {
+    // Every existing strategy gets mode='paper' — identical to its actual prior behavior
+    // (nothing anywhere could create a live-mode strategy record before this change).
+    db.exec("ALTER TABLE strategies ADD COLUMN mode TEXT NOT NULL DEFAULT 'paper'");
+    db.exec("ALTER TABLE strategies ADD COLUMN capital_limit_usd REAL DEFAULT NULL");
+  }
   const executionsColumns = db.prepare("PRAGMA table_info(executions)").all() as Array<{ name: string }>;
   if (!executionsColumns.some((c) => c.name === "funding_step_json")) {
     db.exec("ALTER TABLE executions ADD COLUMN funding_step_json TEXT DEFAULT NULL");
@@ -177,6 +183,10 @@ export interface StrategyRow {
   funding_buffer_usd: number;
   funding_per_cycle_cap_usd: number;
   funding_period_cap_usd: number | null;
+  /** 'paper' (default) or 'live'. See the schema's own doc comment — this, not HEDGEOS_MODE, is what the passive worker checks per-strategy before auto-processing a due cycle. */
+  mode: "paper" | "live";
+  /** Total lifetime capital cap for a 'live' strategy. Required (and enforced by createStrategy) when mode='live'; null for paper. */
+  capital_limit_usd: number | null;
 }
 
 /**
@@ -219,6 +229,10 @@ export function createStrategy(
     fundingPerCycleCapUsd?: number;
     /** Optional rolling-period (e.g. daily) transfer ceiling, independent of the per-cycle cap. */
     fundingPeriodCapUsd?: number;
+    /** 'paper' (default, unchanged prior behavior) or 'live'. A 'live' strategy's due cycles are created on schedule but never auto-processed by the passive worker — only an explicit trigger_live_cycle call, itself gated by assertLiveTradingGate, can execute one. */
+    mode?: "paper" | "live";
+    /** Required, positive, when mode='live' — the strategy's total lifetime spending cap, independent of and in addition to the per-cycle contribution and funding caps. Refusing to create an unbounded live strategy. */
+    capitalLimitUsd?: number;
   },
 ): StrategyRow {
   const hedgeLeverage = args.hedgeLeverage ?? DEFAULT_HEDGE_LEVERAGE;
@@ -233,10 +247,19 @@ export function createStrategy(
   if (fundingMode === "auto" && (args.fundingPerCycleCapUsd === undefined || args.fundingPerCycleCapUsd <= 0)) {
     throw new Error(`fundingMode="auto" requires an explicit, positive fundingPerCycleCapUsd — refusing to enable automatic transfers with no configured limit.`);
   }
+  const mode = args.mode ?? "paper";
+  if (mode === "live") {
+    if (args.capitalLimitUsd === undefined || args.capitalLimitUsd <= 0) {
+      throw new Error(`mode="live" requires an explicit, positive capitalLimitUsd — refusing to create an unbounded live strategy.`);
+    }
+    if (args.endAt === undefined) {
+      throw new Error(`mode="live" requires an explicit endAt (finite duration) — refusing to create an unattended, indefinitely-recurring live strategy. Pass an end date, or plan to pause it yourself.`);
+    }
+  }
 
   const stmt = db.prepare(
-    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at, end_at, interval_minutes, funding_mode, funding_buffer_usd, funding_per_cycle_cap_usd, funding_period_cap_usd)
-     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')), @endAt, @intervalMinutes, @fundingMode, @fundingBufferUsd, @fundingPerCycleCapUsd, @fundingPeriodCapUsd)`,
+    `INSERT INTO strategies (ticker, spot_symbol, futures_symbol, contribution_usd, frequency, hedge_leverage, next_due_at, end_at, interval_minutes, funding_mode, funding_buffer_usd, funding_per_cycle_cap_usd, funding_period_cap_usd, mode, capital_limit_usd)
+     VALUES (@ticker, @spotSymbol, @futuresSymbol, @contributionUsd, @frequency, @hedgeLeverage, COALESCE(@firstDueAt, datetime('now')), @endAt, @intervalMinutes, @fundingMode, @fundingBufferUsd, @fundingPerCycleCapUsd, @fundingPeriodCapUsd, @mode, @capitalLimitUsd)`,
   );
   const info = stmt.run({
     ticker: args.ticker,
@@ -252,6 +275,8 @@ export function createStrategy(
     fundingBufferUsd: args.fundingBufferUsd ?? 0,
     fundingPerCycleCapUsd: args.fundingPerCycleCapUsd ?? 0,
     fundingPeriodCapUsd: args.fundingPeriodCapUsd ?? null,
+    mode,
+    capitalLimitUsd: args.capitalLimitUsd ?? null,
   });
   return db.prepare("SELECT * FROM strategies WHERE id = ?").get(info.lastInsertRowid) as StrategyRow;
 }

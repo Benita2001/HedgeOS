@@ -27,6 +27,18 @@ CREATE TABLE IF NOT EXISTS strategies (
   funding_buffer_usd REAL NOT NULL DEFAULT 0,
   funding_per_cycle_cap_usd REAL NOT NULL DEFAULT 0,
   funding_period_cap_usd REAL DEFAULT NULL,
+  -- Per-strategy execution mode — 'paper' (default, identical to every prior strategy's
+  -- behavior) or 'live'. This is what the passive worker tick loop checks to decide
+  -- whether to auto-process a due cycle at all: a 'live' strategy's due cycles are
+  -- created on schedule but NEVER auto-claimed/executed by the worker — only an explicit,
+  -- separately-gated operator action (trigger_live_cycle) can process one. This is
+  -- deliberately independent of HEDGEOS_MODE (the process-wide env var, still checked by
+  -- assertLiveTradingGate) — both a strategy marked 'live' AND the full live-trading gate
+  -- must agree before any real order is placed.
+  mode TEXT NOT NULL DEFAULT 'paper' CHECK (mode IN ('paper', 'live')),
+  -- Total lifetime capital cap for a 'live' strategy (distinct from per-cycle contribution_usd) —
+  -- required and enforced only when mode='live'; NULL for paper strategies.
+  capital_limit_usd REAL DEFAULT NULL,
   -- Optional ISO timestamp: the scheduler creates no new cycle whose scheduled_for is after this
   -- (a cycle scheduled exactly at end_at is still created — inclusive boundary). NULL (the default,
   -- and the only value every strategy created before this column existed has) means "runs

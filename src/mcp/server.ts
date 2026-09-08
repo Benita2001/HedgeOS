@@ -343,6 +343,9 @@ server.registerTool(
     const strategy = getStrategy(db, strategyId);
     if (!strategy) return errorResult(`no strategy with id ${strategyId}`);
     if (strategy.status !== "active") return errorResult(`strategy ${strategyId} is ${strategy.status}, not active`);
+    if (strategy.mode === "live") {
+      return errorResult(`strategy ${strategyId} is a LIVE-mode strategy — use trigger_live_cycle instead, which requires the full live-trading gate. This tool never places real orders.`);
+    }
 
     const adapter = await getExecutionAdapter();
     if (adapter.mode !== "paper") {
@@ -362,6 +365,116 @@ server.registerTool(
 
     const receipt = await processCycle(db, claimed, strategy, adapter);
     return textResult({ triggered: true, receipt });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// LIVE-mode tools — completely separate creation/trigger path from the paper
+// tools above. Reuse the exact same sizing engine, scheduler, live adapter,
+// funding reservation, and reconciliation logic — no second trading engine.
+// A live strategy's due cycles are created on schedule (ensureDueCycles,
+// unchanged) but the passive worker (worker/index.ts) never auto-claims them
+// — only trigger_live_cycle, below, can, and only after the full
+// assertLiveTradingGate passes independently of this strategy's own mode.
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "create_live_strategy",
+  {
+    title: "Create a LIVE-mode strategy — real money, once activated",
+    description:
+      "Creates a strategy record marked mode='live'. This call ALONE places no order and transfers no funds — it only persists the strategy's configuration. A live strategy's due cycles are created on schedule but the passive worker NEVER auto-executes them; only an explicit, separate `trigger_live_cycle` call (itself gated by the real live-trading environment gate: BINANCE_API_KEY/SECRET + HEDGEOS_MODE=live + HEDGEOS_LIVE_TRADING_CONFIRMED + HEDGEOS_LIVE_CHECKLIST_COMPLETE) can process one. Requires an explicit, positive capitalLimitUsd (total lifetime spend cap, separate from the per-cycle contribution) and an explicit endAt (finite duration — unattended indefinite live recurrence is refused). Do not call this from an ambiguous or paper-sounding request — only when the user has explicitly said something like 'real money' or 'live'.",
+    inputSchema: {
+      ticker: z.string().min(1),
+      contributionUsd: z.number().positive(),
+      frequency: z.enum(["daily", "weekly", "monthly"]),
+      hedgeLeverage: z.number().refine((n) => (ALLOWED_HEDGE_LEVERAGES as readonly number[]).includes(n), {
+        message: `hedgeLeverage must be one of ${ALLOWED_HEDGE_LEVERAGES.join(", ")}`,
+      }).default(DEFAULT_HEDGE_LEVERAGE),
+      intervalMinutes: z.number().int().min(MIN_INTERVAL_MINUTES).optional(),
+      endAt: z.string().datetime(),
+      capitalLimitUsd: z.number().positive(),
+      fundingMode: z.enum(["prefunded", "auto"]).default("prefunded"),
+      fundingBufferUsd: z.number().min(0).optional(),
+      fundingPerCycleCapUsd: z.number().positive().optional(),
+      fundingPeriodCapUsd: z.number().positive().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  async ({ ticker, contributionUsd, frequency, hedgeLeverage, intervalMinutes, endAt, capitalLimitUsd, fundingMode, fundingBufferUsd, fundingPerCycleCapUsd, fundingPeriodCapUsd }) => {
+    const upper = ticker.toUpperCase();
+    try {
+      const strategy = createStrategy(db, {
+        ticker: upper,
+        spotSymbol: `${upper}BUSDT`,
+        futuresSymbol: `${upper}USDT`,
+        contributionUsd,
+        frequency,
+        hedgeLeverage,
+        intervalMinutes,
+        endAt,
+        mode: "live",
+        capitalLimitUsd,
+        fundingMode,
+        fundingBufferUsd,
+        fundingPerCycleCapUsd,
+        fundingPeriodCapUsd,
+      });
+      return textResult({
+        created: strategy,
+        note:
+          `LIVE-MODE STRATEGY CREATED — NO ORDER HAS BEEN PLACED, NO FUNDS TRANSFERRED. ` +
+          `Capital limit $${capitalLimitUsd} over its lifetime, ends ${endAt}. The passive worker will never auto-execute this — ` +
+          `each cycle needs an explicit trigger_live_cycle call, which independently requires the full live-trading environment gate to be set. ` +
+          `Funding policy: ${fundingMode}${fundingMode === "auto" ? ` (up to $${fundingPerCycleCapUsd}/cycle automatic transfer, requires its own separate HEDGEOS_FUNDING_MODE/HEDGEOS_AUTO_FUNDING_CONFIRMED gate too)` : " — you fund the Futures wallet yourself"}.`,
+      });
+    } catch (err) {
+      return errorResult((err as Error).message);
+    }
+  },
+);
+
+server.registerTool(
+  "trigger_live_cycle",
+  {
+    title: "Trigger one REAL due cycle for a live strategy — places a real order if funds/permissions allow",
+    description:
+      "Executes exactly one due cycle for a mode='live' strategy through the real, tested LiveExecutionAdapter — same sizing engine, same idempotent claim path, same funding-reservation/reconciliation logic as everything else in this project. REQUIRES the full live-trading gate to already be set in THIS MCP server process's own environment (BINANCE_API_KEY/BINANCE_API_SECRET, HEDGEOS_MODE=live, HEDGEOS_LIVE_TRADING_CONFIRMED='I_UNDERSTAND_THE_RISK', HEDGEOS_LIVE_CHECKLIST_COMPLETE='yes') — throws immediately, placing nothing, if any of the four is missing. Refuses if the strategy is not mode='live', not active, or has no due cycle. This is the ONLY tool in this server that can place a real order.",
+    inputSchema: { strategyId: z.number().int().positive() },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  },
+  async ({ strategyId }) => {
+    const strategy = getStrategy(db, strategyId);
+    if (!strategy) return errorResult(`no strategy with id ${strategyId}`);
+    if (strategy.status !== "active") return errorResult(`strategy ${strategyId} is ${strategy.status}, not active`);
+    if (strategy.mode !== "live") {
+      return errorResult(`strategy ${strategyId} is a PAPER-mode strategy — use trigger_due_cycle instead. This tool only operates on mode='live' strategies.`);
+    }
+
+    let creds;
+    try {
+      const { assertLiveTradingGate } = await import("../binance/liveExecution.js");
+      creds = assertLiveTradingGate();
+    } catch (err) {
+      return errorResult(`live-trading gate refused, no order placed: ${(err as Error).message}`);
+    }
+
+    const { LiveExecutionAdapter } = await import("../binance/liveExecution.js");
+    const hedgeLeverage = strategy.hedge_leverage;
+    const adapter = new LiveExecutionAdapter(creds, hedgeLeverage);
+
+    ensureDueCycles(db, strategy, new Date());
+    const due = getPendingAndRetryableCycles(db).filter((c) => c.strategy_id === strategyId);
+    if (due.length === 0) {
+      return textResult({ triggered: false, reason: "no due or retryable cycle for this strategy right now" });
+    }
+    const claimed = claimCycle(db, due[0].id);
+    if (!claimed) {
+      return textResult({ triggered: false, reason: "cycle was claimed by another process between listing and claiming — idempotency guard working as intended" });
+    }
+
+    const receipt = await processCycle(db, claimed, strategy, adapter);
+    return textResult({ triggered: true, mode: "LIVE — this was a real cycle, not a simulation", receipt });
   },
 );
 

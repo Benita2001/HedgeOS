@@ -109,7 +109,17 @@ async function main() {
         buildSpotAccountRequest({ ...creds, timestamp: ts() }),
       );
       const nonZero = r.balances.filter((b) => Number(b.free) > 0 || Number(b.locked) > 0);
-      return { canTrade: r.canTrade, nonZeroAssetCount: nonZero.length, nonZeroAssets: nonZero.map((b) => b.asset) };
+      // Surfaces the USDT amount specifically (the one figure actually needed to plan a real
+      // contribution) — not a secret or account identifier, explicitly requested by the account
+      // owner. Every other asset's amount stays redacted to a bare symbol, as before.
+      const usdt = r.balances.find((b) => b.asset === "USDT");
+      return {
+        canTrade: r.canTrade,
+        nonZeroAssetCount: nonZero.length,
+        nonZeroAssets: nonZero.map((b) => b.asset),
+        spotUsdtFree: usdt ? Number(usdt.free) : 0,
+        spotUsdtLocked: usdt ? Number(usdt.locked) : 0,
+      };
     }),
   );
 

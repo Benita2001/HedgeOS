@@ -72,6 +72,15 @@ export async function startWorker() {
           log(`cycle #${claimed.id} has no strategy ${claimed.strategy_id}; leaving as claimed for manual review`);
           continue;
         }
+        if (strategy.mode === "live") {
+          // The passive worker NEVER auto-executes a live-mode strategy's cycle — that
+          // requires an explicit, separately-gated trigger_live_cycle call. Un-claim it
+          // (revert to pending) so it stays available for that manual action rather than
+          // sitting claimed-but-never-processed.
+          db.prepare("UPDATE cycles SET status = 'pending' WHERE id = ?").run(claimed.id);
+          log(`cycle #${claimed.id} (strategy ${strategy.id}, LIVE mode) left pending — the passive worker does not auto-execute live strategies; use trigger_live_cycle explicitly`);
+          continue;
+        }
         log(`cycle #${claimed.id} claimed: strategy ${strategy.id} (${strategy.ticker}) slot ${claimed.scheduled_for}`);
         try {
           const receipt = await processCycle(db, claimed, strategy, adapter);
