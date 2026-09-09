@@ -140,3 +140,53 @@ describe("no routine price-driven rebalancing", () => {
     expect(before.hedge.hedgeBudgetUsd).toEqual(afterPriceMove.hedge.hedgeBudgetUsd);
   });
 });
+
+describe("REAL CASE, 2026-09-08 23:55 UTC — a real live cycle's hedge deferred despite the pre-trade preview showing both legs executable", () => {
+  // Not a bug — this test exists to lock in and document the exact, verified mechanism, using
+  // the real numbers from the real cycle (NVDA, $34 contribution, 2x, main account):
+  //
+  // Preview (before the trade): contribution $34, price $225.53 -> hedge budget $3.40,
+  // target notional $6.80, quantity 0.03, actual notional $6.77 -> EXECUTABLE.
+  //
+  // Live mode re-derives the hedge budget from the ACTUAL stock fill notional, not the
+  // pre-trade estimate (src/worker/runContribution.ts) — the real fill came in at $30.45
+  // (0.135 @ $225.52), a completely ordinary ~$0.15 difference from the preview's estimate.
+  // That alone was enough to cross a step-size rounding boundary and produce a DIFFERENT,
+  // non-executable result — not because of any float/rounding bug (this engine uses exact
+  // BigInt fixed-point arithmetic throughout), but because $34 was chosen as the bare
+  // calculated minimum, with zero safety margin above the threshold.
+  const HEDGE_FILTERS_REAL: SymbolFilters = { stepSize: 0.01, minQty: 0.01, minNotional: 5 };
+  const REAL_MARK_PRICE = 225.58715797;
+
+  it("re-deriving the hedge budget from the ACTUAL $30.45 stock fill (not the $30.60 pre-trade estimate) correctly floors the quantity DOWN a full step, below the exchange minimum", () => {
+    const actualStockFillNotionalUsd = 30.45;
+    const actualHedgeBudgetUsd = Math.round(actualStockFillNotionalUsd * (0.1 / 0.9) * 100) / 100;
+    expect(actualHedgeBudgetUsd).toBe(3.38); // matches the real receipt's hedge.budgetUsd exactly
+
+    const result = sizeHedgeLeg(actualHedgeBudgetUsd, 2, REAL_MARK_PRICE, HEDGE_FILTERS_REAL);
+    expect(result.targetShortNotionalUsd).toBe(6.76); // matches the real receipt exactly
+    // The engine computes an internal snapped quantity of 0.02 (notional $4.51, mentioned in
+    // `reason`) purely to explain WHY the leg is rejected — since it's below minNotional, the
+    // OUTPUT-facing quantity/notional are correctly zeroed (nothing will ever be submitted),
+    // exactly matching the real receipt's requestedQty=0/requestedNotionalUsd=0.
+    expect(result.quantity).toBe(0);
+    expect(result.actualShortNotionalUsd).toBe(0);
+    expect(result.reason).toMatch(/\$4\.51 is below exchange minNotional \$5/); // the internal $4.51 computation, preserved for the human-readable explanation
+    expect(result.executable).toBe(false); // below the real $5 exchange minimum — correctly deferred, never forced through
+    expect(result.deferredBudgetUsd).toBe(3.38); // the full budget is preserved for a future cycle, never dropped
+  });
+
+  it("the SAME $3.40 nominal (pre-trade-estimate) budget WOULD have cleared the minimum — proving this is a real-fill-vs-estimate boundary effect, not a general engine defect", () => {
+    const nominalPreTradeHedgeBudgetUsd = 3.40; // 10% of the full $34 contribution, before re-deriving from the actual fill
+    const result = sizeHedgeLeg(nominalPreTradeHedgeBudgetUsd, 2, REAL_MARK_PRICE, HEDGE_FILTERS_REAL);
+    expect(result.quantity).toBe(0.03);
+    expect(result.actualShortNotionalUsd).toBeCloseTo(6.77, 2);
+    expect(result.executable).toBe(true); // confirms the preview's own math was correct at the time it ran — the outcome changed only because the real fill differed slightly from the estimate
+  });
+
+  it("never oversizes to force execution: 0.03 shares would exceed the $6.76 budget-derived target, so the engine floors to 0.02, not up to 0.03", () => {
+    const targetNotional = 3.38 * 2; // 6.76
+    const costOfNextStepUp = 0.03 * REAL_MARK_PRICE;
+    expect(costOfNextStepUp).toBeGreaterThan(targetNotional); // proves 0.03 would have been an overshoot — flooring to 0.02 was the only budget-respecting choice
+  });
+});

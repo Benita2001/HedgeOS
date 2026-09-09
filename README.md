@@ -55,7 +55,7 @@ Every node above is a real, verified component (`src/mcp/server.ts`, `src/worker
 | Official Binance Skill (`binance`, a `binance-cli` wrapper — separate from the Agent OS MCP server) | ⚠️ **Installed, command surface inspected from source — not execution-verified.** Real `npx skills add` install (security-reviewed, Snyk: Med Risk, disclosed not hidden); its Futures reference docs confirm it can structurally target `NVDAUSDT`/`TRADIFI_PERPETUAL`, independently corroborating `EXECUTION_ROUTE_DECISION.md`. Its own `binance-cli` binary/installer was never run and no command was ever invoked through it — deliberately not wired into HedgeOS (would duplicate `liveExecution.ts`'s already-tested native code). See `docs/BINANCE_SKILLS_HUB_ASSESSMENT.md`. |
 | Live-execution adapter (real signing, order placement, reconciliation) | ✅ **Real code, mock-tested (28+ tests against a fake HTTP client, zero real network calls).** Fail-closed behind a 4-condition gate that nothing in this repo sets. **No real order has ever been placed.** |
 | Real authenticated preflight against a live account | ✅ **Actually run once, this session**, against the founder's own real (rotated, least-privilege) key — 10/10 read-only checks passed. See `LIVE_TRADING_READINESS.md`. |
-| Live orders | ❌ **Never placed.** Blocked on funding ($0 in both wallets as of the last check) and your explicit per-order authorization. |
+| Live orders | ⚠️ **One real order placed and filled** (NVDA stock leg, 2026-09-08 — see "Live proof" below). **The matching hedge order was never placed** — correctly deferred, below exchange minimum after re-deriving from the actual fill. No complete hedged cycle has occurred. |
 | Funding-readiness check for any user's own account | ✅ **Real, tested**, read-only. `check_funding_readiness` MCP tool / `docs/FUNDING_READINESS.md`. |
 | Automatic Spot→Futures funding transfer | ⚠️ **Real code, mock-tested (48 tests, zero real network calls), wired into the recurring lifecycle, gated separately from live trading.** Defaults to `prefunded`; `auto` mode requires an explicit per-cycle cap plus a separate runtime gate. Shared-wallet reservation is a real, atomically-locked claim (`reserveFundingAtomically` — SQLite `IMMEDIATE` transaction, proven with two genuinely separate connections to the same file), not just a sum. **Never executed against a real account. Still permission-blocked**: `enableInternalTransfer` is `true` but a second flag, `permitsUniversalTransfer`, is confirmed `false` — corrected this session after an incomplete earlier check. See `docs/FUNDING_READINESS.md`. |
 | Self-hosted install for a second, independent user | ✅ **Deploy tooling is generic** (parameterized by `HEDGEOS_DEPLOY_HOST`, no hardcoded IP/paths — verified by grep this session). `docs/SELF_HOSTED_INSTALL.md`. |
@@ -85,16 +85,26 @@ Everything below actually happened, this session, against the real deployed VPS 
 - **Real deployment discipline**: a genuine rsync bug (an older multi-source invocation silently dropped new files) was caught by comparing file counts before trusting the deploy, not assumed clean — documented in `PROGRESS_LOG.md` checkpoint 15 rather than glossed over.
 - **211/211 tests passing**, on this machine and independently re-run on the VPS itself, clean typecheck both places.
 
-### Live (real-money) proof — not yet done, this section gets filled in when it is
+### Live (real-money) proof — verified 2026-09-08 23:55 UTC, main Binance account
 
-Nothing below has happened. No real order has been placed; no funds have been transferred. Live execution code is real, tested (61+ tests against a mocked HTTP client — see `LiveExecutionAdapter`, `fundingReadiness.ts`, `fundingTransfer.ts`, `reserveFundingAtomically`), deployed, and gated behind independent environment conditions nothing in this repo sets. A real, authenticated, read-only preflight has been run repeatedly against the account owner's own key (see `LIVE_TRADING_READINESS.md`) — permissions and balances are tracked there, not claimed here.
+**One real cycle executed, one leg filled, one leg correctly deferred — not a complete hedged cycle.** Reported exactly as it happened, not rounded up.
 
-When a real controlled cycle actually executes, this section will be replaced with:
-- the real strategy id, ticker, contribution amount, and leverage (whatever the account owner actually chose — not a fixed demo value)
-- the real Binance order IDs and `tranId` (if a funding transfer occurred) for both legs
-- the real fill prices/quantities/fees, pulled from the account owner's own trade history via the same reconciliation path already tested, not asserted
-- the real durable receipt row, exactly as read from the production database
-- confirmation that the position was independently verified against the exchange's own account state, not just HedgeOS's local record
+**Configuration** (strategy #5, `mode=live`, structurally one-cycle-only — 10-minute `end_at` window, `capital_limit_usd=$34` — the passive worker never touched this and never will; it required a separate, explicit `authorize_live_strategy` call plus an ephemeral, gate-checked MCP session, never a standing credential in the persistent worker's environment):
+
+| | |
+|---|---|
+| Ticker / contribution / leverage | NVDA, $34 USDT total, 2× |
+| **Stock leg (NVDABUSDT BUY)** | **Filled.** 0.135 shares @ avg $225.52, notional $30.45, fee $0.03, order id `55280737` |
+| **Hedge leg (NVDAUSDT SELL)** | **Deferred — never sent to the exchange.** Re-derived hedge budget from the actual fill ($30.45, not the pre-trade $30.60 estimate) came to $3.38; at 2× that snaps to a quantity below the $5 exchange minimum notional. Correctly refused rather than forced through with more leverage or an oversized order — see the root-cause analysis and locked-in regression test below. |
+| Automatic funding transfer | **None occurred** — never attempted, since the hedge leg was never executable |
+| Independent exchange confirmation | Spot now holds a real `NVDAB` token (new asset, confirmed via a fresh authenticated read); Spot USDT dropped from $36.26 to $5.82; Futures shows **zero** open position and **zero** open orders — confirmed directly against the exchange's own account/position endpoints, not only HedgeOS's own receipt |
+| Durable receipt | `execution_id 23`, `receipt id 42` (stock leg), `mode=live`, `simulated=0`, read directly from the production database |
+
+**Why the hedge deferred — root cause, not a guess**: live mode re-derives the hedge budget from the *actual* stock fill, which came in about $0.15 below the pre-trade estimate — an entirely ordinary amount of price movement between proposal and fill. Because $34 was chosen as the bare calculated minimum with zero safety margin, that small, normal difference was enough to cross a step-size rounding boundary and drop the hedge quantity a full step below the exchange minimum. Verified against the exact sizing code (`src/engine/sizing.ts`) with the real numbers, and locked in as a permanent regression test (`tests/sizing.test.ts`, "REAL CASE, 2026-09-08 23:55 UTC") — this is confirmed, deterministic, policy-correct behavior (never oversize the hedge to force execution), not a bug.
+
+**Current state, unresolved**: the account holds a real, unhedged 0.135-share NVDA stock position. Recovery options are under discussion; none has been executed. This section will be updated again if and when that changes.
+
+**What this proves**: the live order-placement, reconciliation, and deferred-budget-preservation paths are real and working end-to-end against a real account. **What this does not prove**: a complete, hedged live cycle — that has not yet happened.
 
 ## The observe → decide → act → verify loop
 
@@ -147,7 +157,7 @@ src/
 
 ```bash
 npm install
-npm test              # 211 tests
+npm test              # 214 tests
 npx tsc --noEmit       # typecheck
 ```
 
@@ -210,7 +220,7 @@ export HEDGEOS_DEPLOY_HOST=root@<your-host>
 
 ## What this is not
 
-Not a chatbot — the AI proposes and confirms, it doesn't compute money math. Not a guarantee of downside protection, a continuous 10% hedge ratio, or a maximum-loss cap. Not (yet) connected to real money — no order placed, no strategy authorized, on any real account. Not multi-tenant.
+Not a chatbot — the AI proposes and confirms, it doesn't compute money math. Not a guarantee of downside protection, a continuous 10% hedge ratio, or a maximum-loss cap. Not yet a *complete hedged* live cycle — one real stock order has filled (see "Live proof"), but no matching hedge order has ever been placed; the account currently holds a real, unhedged position. Not multi-tenant.
 
 ## Documents
 
