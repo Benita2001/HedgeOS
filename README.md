@@ -1,239 +1,270 @@
 # HedgeOS
 
-**A persistent, autonomous protected-DCA agent for Binance stock/bStock investments.** Say "invest $250 into AAPL every week" through Claude Code or Codex; HedgeOS runs the recurring strategy unattended on its own VPS, forever, independent of your laptop being open.
+**Autonomous stock accumulation with a corresponding hedge, operated through Claude Code or Codex.**
 
-Built for the Binance Agent OS Mini Hackathon (Track A).
+Built for the Binance Agent OS Mini Hackathon · Track A — Agent Creation
 
-## Problem
+HedgeOS turns a natural-language investment instruction into a persistent, exchange-aware strategy. Instead of manually repeating stock purchases, calculating a Futures hedge, and keeping a trading terminal open, users can configure a strategy once and let a dedicated worker manage the schedule, execution, and records.
 
-Dollar-cost-averaging into a stock exposes you to that stock's full downside with no offset, and doing it "properly" — sizing a hedge correctly against live exchange filters, on a schedule, without babysitting it — isn't something a person or a one-off script does reliably. Most "AI trading agent" demos are a chat session that stops the moment you close the tab; they aren't actually autonomous.
+> “Invest $100 in Nvidia every week for six months. Show me the proposal before activating it.”
 
-## Solution
+The application validates the supported Binance bStock and matching TradFi perpetual, calculates the allocation, checks exchange minimums, and presents the strategy for confirmation. Its deterministic engine handles financial calculations; Claude Code or Codex provides the conversational operator interface.
 
-Every contribution is deterministically split 90% into the stock (via Binance's tokenized bStock spot market) and 10% into collateral for an exact matching short TradFi perpetual — sized against real, live exchange filters with exact fixed-point arithmetic, never delegated to an LLM. This runs inside a persistent worker process on a VPS, not inside the AI conversation: Claude Code/Codex is the **operator** (propose, confirm, inspect, pause) via HedgeOS's own MCP server; the recurring execution itself keeps going whether or not anyone is watching. Real Binance Agent OS MCP calls provide corroborating market evidence; HedgeOS's own independent discovery is what actually prices every order.
+**Current evidence:** Autonomous paper execution is verified on a persistent VPS, Binance Agent OS and HedgeOS MCP have been exercised with real tool calls, and a real NVDAB Spot purchase has been independently reconciled against Binance. The first live hedge was deferred by the exchange-minimum sizing policy, so a complete real-money hedged cycle is not yet verified. See [Live execution evidence](#live-execution-evidence) for the exact outcome.
 
-## System architecture
+## The problem
+
+Recurring stock investing is easy to describe but harder to operate when the investor also wants a corresponding hedge. Each contribution needs instrument validation, exchange-aware sizing, funding, scheduling, execution, and reconciliation.
+
+A short perpetual can offset some downside exposure, but it introduces its own margin, funding, basis, and liquidation risks. It is not insurance.
+
+Most importantly, a chat session is not a persistent trading service. A useful agent must continue operating after the user closes Claude, preserve its state across restarts, and make partial executions and failures visible instead of pretending every cycle succeeded.
+
+## The solution
+
+HedgeOS combines a natural-language operator with a deterministic execution service:
+
+* **Configure in plain English.** Choose a supported ticker, contribution amount, cadence, duration, and hedge leverage. The AI translates intent into a structured proposal; it does not decide trade quantities or override risk rules.
+* **Allocate each contribution.** The default policy assigns 90% to the bStock and 10% to a hedge collateral budget. The hedge targets 2× that collateral budget by default, with 3× optional.
+* **Respect the exchange.** Both legs are sized against live instrument filters using exact fixed-point arithmetic. Insufficient budgets are deferred rather than oversizing an order or increasing leverage to force execution.
+* **Run independently.** A persistent worker manages due cycles, durable state, receipts, and restart recovery. Claude Code and Codex can be closed without stopping the worker.
+* **Separate authorization from execution.** Paper and live strategies are distinct. Live creation, authorization, and execution are separate operations, with capital, schedule, credential, and funding gates.
+* **Make outcomes inspectable.** The MCP tools and read-only dashboard expose strategies, execution history, receipts, deferred budgets, and risk alerts.
+
+### Example allocation
+
+For an illustrative $100 contribution at 2×, the policy assigns $90 to stock and $10 to hedge collateral, targeting approximately $20 of short notional before exchange filters, rounding, and fees.
+
+That is a partial offset, not a full hedge or a guaranteed loss limit. Actual executable quantities may be smaller, and a leg may be deferred.
+
+## How it works
 
 ```mermaid
-flowchart TB
-    U["Operator (you)"] -->|"natural-language request"| CC["Claude Code / Codex"]
-    CC -->|"real MCP tool calls"| AOS["Binance Agent OS MCP\n(session-bound, evidence only)"]
-    CC -->|"real MCP tool calls"| HMCP["HedgeOS MCP server\n(src/mcp/server.ts)"]
-
-    HMCP -->|"preview / create / authorize / trigger / pause"| DB[("SQLite\nstrategies · cycles · executions · receipts")]
-    HMCP -.->|"read status/receipts"| DB
-
-    W["Persistent worker\n(src/worker/index.ts, systemd, VPS)"] -->|"tick every 60s"| DB
-    W -->|"observe: live discovery"| REST["Binance public REST\n(api./fapi.binance.com)"]
-    W -->|"decide: 90/10 sizing"| ENGINE["Deterministic engine\n(src/engine — no LLM)"]
-    ENGINE --> W
-
-    W -->|"paper strategies: act"| PAPER["PaperExecutionAdapter\n(simulated fill)"]
-    W -->|"authorized live strategies only,\ngate re-checked every cycle"| LIVE["LiveExecutionAdapter\n(real signed REST, gated)"]
-    LIVE -->|"order + funding transfer"| BINANCE["Binance Spot + USDⓈ-M Futures\n(real account)"]
-    BINANCE -->|"reconciliation"| LIVE
-
-    PAPER -->|"verify: durable receipt"| DB
-    LIVE -->|"verify: durable receipt"| DB
-
-    DASH["Read-only dashboard\n(127.0.0.1 only)"] -->|"read"| DB
+flowchart TD
+    U[User request] --> C[Claude Code or Codex]
+    C --> A[Binance Agent OS MCP]
+    A -->|Market observations| H[HedgeOS MCP]
+    C -->|Proposal and authorization| H
+    H --> D[(SQLite: strategies, cycles, receipts)]
+    D --> W[Persistent VPS worker]
+    W --> V[Live instrument discovery]
+    V --> E[Deterministic sizing and risk engine]
+    E --> P[Paper execution or authorized live adapter]
+    P --> R[Reconciliation and durable receipts]
+    R --> D
 ```
 
-Every node above is a real, verified component (`src/mcp/server.ts`, `src/worker/index.ts`, `src/engine/`, `src/binance/execution.ts`/`liveExecution.ts`, the SQLite file, the Express dashboard) — none of this is planned or aspirational. The critical path a judge should trace: **operator request → HedgeOS MCP → persistent worker (independent of the chat session) → deterministic engine → Binance REST → durable receipt**, with Agent OS as a corroborating evidence layer feeding into HedgeOS's own MCP tools, never into the engine directly.
+**Binance Agent OS is an operator-side integration.** Real MCP calls provide market and account observations that HedgeOS can cross-check against its own discovery. The worker currently uses Binance's official REST APIs for market discovery and authenticated execution; it does not depend on an interactive Agent OS session staying open.
 
-## Status — read this before anything else below
+The official Binance Skill was also installed and its command surface inspected, but its CLI was not execution-verified or wired into the trading path. These are separate integration surfaces, not interchangeable claims.
 
-| Capability | Status |
-|---|---|
-| Persistent worker, restart-safe idempotent scheduling | ✅ **Real, running, tested.** Deployed on a VPS independent of any laptop/chat session. |
-| Deterministic sizing engine (90/10 split, 2×/3× leverage, exact BigInt arithmetic) | ✅ **Real, tested.** Generic across ticker/amount — see "Generic, not a demo" below. |
-| Live instrument discovery (authoritative identity, not naming-pattern guessing) | ✅ **Real, tested against live Binance data.** |
-| Paper execution (partial-fill/rejection modeling) | ✅ **Real, tested.** Every paper fill is explicitly labeled `simulated`. |
-| Binance Agent OS MCP integration | ✅ **Real, verified with actual tool calls this session** — operator-side evidence layer, session-bound (no headless auth exists for it). See `docs/AGENT_OS_OPERATOR_WORKFLOW.md`. |
-| HedgeOS's own MCP server (Claude Code) | ✅ **Real, smoke-tested end-to-end** against the actual server subprocess. |
-| HedgeOS's own MCP server (Codex) | ✅ **Tested, working — verified 2026-09-08.** Real `codex exec` session, real MCP tool calls (`list_strategies`, `get_strategy_status`), real correct results. See `docs/OPERATOR_GUIDE.md`. |
-| Official Binance Skill (`binance`, a `binance-cli` wrapper — separate from the Agent OS MCP server) | ⚠️ **Installed, command surface inspected from source — not execution-verified.** Real `npx skills add` install (security-reviewed, Snyk: Med Risk, disclosed not hidden); its Futures reference docs confirm it can structurally target `NVDAUSDT`/`TRADIFI_PERPETUAL`, independently corroborating `EXECUTION_ROUTE_DECISION.md`. Its own `binance-cli` binary/installer was never run and no command was ever invoked through it — deliberately not wired into HedgeOS (would duplicate `liveExecution.ts`'s already-tested native code). See `docs/BINANCE_SKILLS_HUB_ASSESSMENT.md`. |
-| Live-execution adapter (real signing, order placement, reconciliation) | ✅ **Real code, mock-tested (28+ tests against a fake HTTP client, zero real network calls).** Fail-closed behind a 4-condition gate that nothing in this repo sets. **No real order has ever been placed.** |
-| Real authenticated preflight against a live account | ✅ **Actually run once, this session**, against the founder's own real (rotated, least-privilege) key — 10/10 read-only checks passed. See `LIVE_TRADING_READINESS.md`. |
-| Live orders | ⚠️ **One real order placed and filled** (NVDA stock leg, 2026-09-08 — see "Live proof" below). **The matching hedge order was never placed** — correctly deferred, below exchange minimum after re-deriving from the actual fill. No complete hedged cycle has occurred. |
-| Funding-readiness check for any user's own account | ✅ **Real, tested**, read-only. `check_funding_readiness` MCP tool / `docs/FUNDING_READINESS.md`. |
-| Automatic Spot→Futures funding transfer | ⚠️ **Real code, mock-tested (48 tests, zero real network calls), wired into the recurring lifecycle, gated separately from live trading.** Defaults to `prefunded`; `auto` mode requires an explicit per-cycle cap plus a separate runtime gate. Shared-wallet reservation is a real, atomically-locked claim (`reserveFundingAtomically` — SQLite `IMMEDIATE` transaction, proven with two genuinely separate connections to the same file), not just a sum. **Never executed against a real account. Still permission-blocked**: `enableInternalTransfer` is `true` but a second flag, `permitsUniversalTransfer`, is confirmed `false` — corrected this session after an incomplete earlier check. See `docs/FUNDING_READINESS.md`. |
-| Self-hosted install for a second, independent user | ✅ **Deploy tooling is generic** (parameterized by `HEDGEOS_DEPLOY_HOST`, no hardcoded IP/paths — verified by grep this session). `docs/SELF_HOSTED_INSTALL.md`. |
-| Multi-tenant hosting (many users, one shared instance) | ❌ **Not built.** Architecture documented in `docs/MULTI_TENANT_ARCHITECTURE.md` — explicitly a design sketch, not a claim of implementation. |
-| Natural-language strategy proposals: any amount, any cadence ("...every 10 minutes"), finite duration ("...for six months") | ✅ **Workflow documented** (`docs/OPERATOR_GUIDE.md`) and **cadence + duration enforcement are real and tested**: `strategies.interval_minutes` (generic whole-minute cadence, overrides `frequency`, 1-minute documented floor tied to the worker's own tick granularity — not any specific demo value) and `strategies.end_at` (optional end date), both migration-tested against a pre-existing database, both enforced deterministically by the scheduler (`ensureDueCycles`) — no cycle ever created past `end_at`, missed-cycle catch-up correctly capped near any boundary, a schedule ending never touches accumulated positions. The AI extracts intent and computes concrete values; only the deterministic engine enforces them — not independent LLM reasoning about trading decisions. |
-| Full recurring live lifecycle (due cycle → stock order → reconciliation → re-derived hedge sizing → hedge order → reconciliation → receipt → next cycle) | ✅ **Real code, integration-tested** across two consecutive cycles with a live-shaped mock adapter (`tests/liveLifecycle.test.ts`) — proves a mid-lifecycle failure in one cycle doesn't corrupt an earlier cycle's real fill or block future scheduling. Still gated: no real order has ever been placed. |
-| Autonomous live execution lifecycle (draft → authorized → worker auto-executes) | ✅ **Real code, deployed, tested (21 tests).** `create_live_strategy` (draft, places nothing) → `authorize_live_strategy` (required, separate, explicit) → the worker re-checks authorization/expiry/capital-exhaustion on every due cycle before ever constructing a real adapter. A paused/expired/exhausted/unauthorized strategy never executes — verified by reproducing the worker's exact gate logic in tests, not just asserted. **No strategy has ever actually been authorized on the real account.** |
+The source of truth for money math is `src/engine/`. The source of truth for due-cycle execution is the persistent worker and shared database, not the language model.
 
-Full evidence, checkpoint by checkpoint: `PROGRESS_LOG.md`.
+## Verified evidence
 
-## Proof
+### Autonomous paper execution
 
-### Paper-mode proof — done, real, reproducible
+The founder's VPS ran an AAPL paper strategy with a $77 contribution and a configurable five-minute interval. A manually triggered cycle was followed by a second cycle fired by the worker's own tick without operator intervention. Both produced durable, explicitly simulated stock and hedge receipts.
 
-Everything below actually happened, this session, against the real deployed VPS and real live market data — not asserted, not simulated evidence of evidence.
+| Evidence              | Verified result                                                       |
+| --------------------- | --------------------------------------------------------------------- |
+| Persistent scheduling | Worker-generated AAPL cycle without operator intervention             |
+| Paper stock leg       | 0.218 AAPLB at approximately $316.48 in the autonomous cycle          |
+| Paper hedge leg       | 0.04 AAPLUSDT short at approximately $316.56                          |
+| Receipt labeling      | `mode=paper`, `simulated=1`                                           |
+| Restart recovery      | Worker restarts and durable cycle reconciliation tested               |
+| Claude Code           | HedgeOS MCP connected and exercised against deployed state            |
+| Codex                 | Real MCP registration and read-only strategy/status calls verified    |
+| Binance Agent OS      | Real price, exchange-information, and permission-tool calls exercised |
+| Automated checks      | 214/214 tests and clean typecheck reported at commit `921f5ac`        |
 
-- **Real autonomous execution, unattended.** Strategy #2 (AAPL, $77/cycle, every 5 minutes) fired **on its own**, via the persistent worker's own tick — not a manual trigger — 5 minutes after creation, with zero operator action in between. Two consecutive real cycles, both `completed`:
-  | Cycle | Stock (AAPLBUSDT BUY) | Hedge (AAPLUSDT SELL) |
-  |---|---|---|
-  | #2 (manual trigger) | 0.218 @ $316.47 = $68.99 | 0.04 @ $316.56 = $12.66 |
-  | #3 (**autonomous worker tick**) | 0.218 @ $316.48 = $68.99 | 0.04 @ $316.56 = $12.66 |
+Paper fills are simulations using real market prices. They are not exchange transactions. The full checkpoint history is retained in [PROGRESS_LOG.md](PROGRESS_LOG.md).
 
-  Both `mode=paper`, `simulated=1` in the durable `receipts` table — pulled directly from the production SQLite file, not a log line.
-- **Real restart recovery.** The worker has been restarted multiple times across this session (redeployments) — every time, `journalctl` shows `no interrupted cycles found at startup` and zero duplicate executions, confirmed by direct row counts, not just log trust.
-- **Real Binance Agent OS MCP calls**, this session: `spot_tickerPrice`, `futures_usds_symbolPriceTicker`, `futures_usds_exchangeInformation`, `wallet_getApiKeyPermission` — actual tool names, actual results, cross-checked against HedgeOS's own independent public-REST discovery before any sizing decision.
-- **Real Codex session**: `codex mcp add` + a live `codex exec` run that correctly called `list_strategies`/`get_strategy_status` against the real deployed database (session id `01a0824a-e323-7631-be0c-c5ad5937e245`).
-- **Real deployment discipline**: a genuine rsync bug (an older multi-source invocation silently dropped new files) was caught by comparing file counts before trusting the deploy, not assumed clean — documented in `PROGRESS_LOG.md` checkpoint 15 rather than glossed over.
-- **211/211 tests passing**, on this machine and independently re-run on the VPS itself, clean typecheck both places.
+### Live execution evidence
 
-### Live (real-money) proof — verified 2026-09-08 23:55 UTC, main Binance account
+**A real Spot purchase has been verified. A complete live stock-plus-hedge cycle has not.**
 
-**One real cycle executed, one leg filled, one leg correctly deferred — not a complete hedged cycle.** Reported exactly as it happened, not rounded up.
+On September 8, 2026, a separately authorized, one-cycle-only live strategy executed against the founder's main Binance account. The resulting Spot fill was independently checked against exchange account and trade data, not merely inferred from a HedgeOS receipt.
 
-**Configuration** (strategy #5, `mode=live`, structurally one-cycle-only — 10-minute `end_at` window, `capital_limit_usd=$34` — the passive worker never touched this and never will; it required a separate, explicit `authorize_live_strategy` call plus an ephemeral, gate-checked MCP session, never a standing credential in the persistent worker's environment):
+| Item                       | Verified outcome                                   |
+| -------------------------- | -------------------------------------------------- |
+| Instrument                 | NVDABUSDT, BUY                                     |
+| Filled quantity            | 0.135 NVDAB                                        |
+| Average fill price         | $225.52                                            |
+| Stock notional             | Approximately $30.45, plus approximately $0.03 fee |
+| Hedge                      | Deferred before submission to Binance              |
+| Automatic funding transfer | None occurred                                      |
+| Futures position           | Zero at the post-execution verification            |
+| Durable record             | Live execution with `simulated=0`                  |
 
-| | |
-|---|---|
-| Ticker / contribution / leverage | NVDA, $34 USDT total, 2× |
-| **Stock leg (NVDABUSDT BUY)** | **Filled.** 0.135 shares @ avg $225.52, notional $30.45, fee $0.03, order id `55280737` |
-| **Hedge leg (NVDAUSDT SELL)** | **Deferred — never sent to the exchange.** Re-derived hedge budget from the actual fill ($30.45, not the pre-trade $30.60 estimate) came to $3.38; at 2× that snaps to a quantity below the $5 exchange minimum notional. Correctly refused rather than forced through with more leverage or an oversized order — see the root-cause analysis and locked-in regression test below. |
-| Automatic funding transfer | **None occurred** — never attempted, since the hedge leg was never executable |
-| Independent exchange confirmation | Spot now holds a real `NVDAB` token (new asset, confirmed via a fresh authenticated read); Spot USDT dropped from $36.26 to $5.82; Futures shows **zero** open position and **zero** open orders — confirmed directly against the exchange's own account/position endpoints, not only HedgeOS's own receipt |
-| Durable receipt | `execution_id 23`, `receipt id 42` (stock leg), `mode=live`, `simulated=0`, read directly from the production database |
+The hedge was deferred because the budget was recalculated from the actual stock fill. Its target short notional was $6.76. At the observed Futures price and 0.01 quantity step, 0.03 contracts would have exceeded that target; flooring to 0.02 produced approximately $4.51 of notional, below the exchange's $5 minimum.
 
-**Why the hedge deferred — root cause, not a guess**: live mode re-derives the hedge budget from the *actual* stock fill, which came in about $0.15 below the pre-trade estimate — an entirely ordinary amount of price movement between proposal and fill. Because $34 was chosen as the bare calculated minimum with zero safety margin, that small, normal difference was enough to cross a step-size rounding boundary and drop the hedge quantity a full step below the exchange minimum. Verified against the exact sizing code (`src/engine/sizing.ts`) with the real numbers, and locked in as a permanent regression test (`tests/sizing.test.ts`, "REAL CASE, 2026-09-08 23:55 UTC") — this is confirmed, deterministic, policy-correct behavior (never oversize the hedge to force execution), not a bug.
+The engine therefore refused to force an oversized hedge. This real-world rounding-boundary case is covered by a regression test.
 
-**Current state, unresolved**: the account holds a real, unhedged 0.135-share NVDA stock position. Recovery options are under discussion; none has been executed. This section will be updated again if and when that changes.
+**The position remained unhedged at the last verified account read.** No subsequent recovery trade has been confirmed in this repository. The existing cycle is exhausted, and the current operator interface does not yet expose an independent `complete_deferred_hedge` operation for an already-filled stock leg. That is a concrete recovery limitation, not evidence of a completed hedge.
 
-**What this proves**: the live order-placement, reconciliation, and deferred-budget-preservation paths are real and working end-to-end against a real account. **What this does not prove**: a complete, hedged live cycle — that has not yet happened.
+The live test verifies actual Spot order placement, fill reconciliation, durable recording, and the deferred-hedge safety path. It does not verify a live Futures fill, an actual automatic transfer, or unattended recurring real-money trading. Detailed evidence and historical investigation are in [LIVE_TRADING_READINESS.md](LIVE_TRADING_READINESS.md).
 
-## The observe → decide → act → verify loop
+## Replicate the agent
 
-1. **Observe**: live discovery against Binance's own classification fields (not naming patterns) — `src/binance/client.ts`. Optionally corroborated by a real Binance Agent OS MCP observation, evidence-only (`src/observations/externalObservation.ts`).
-2. **Decide**: deterministic sizing (`src/engine/sizing.ts`) — exact BigInt fixed-point math, no LLM anywhere in this path, generic across ticker/amount/leverage.
-3. **Act**: `PaperExecutionAdapter` (real, always-on) or `LiveExecutionAdapter` (real code, gated inert) places the order — `src/binance/execution.ts`.
-4. **Verify**: independent reconciliation against actual trade data (never trusting an order-placement response alone), durable receipts, and a stock-filled/hedge-failed safety net that survives a thrown exception without losing a real fill's record (`src/worker/runContribution.ts`).
+HedgeOS is currently a self-hosted, single-user developer application. Each operator runs their own instance and uses their own account. It is not a public custodial platform, and other users should not connect to the founder's VPS.
 
-This loop runs unattended, on a schedule, in a persistent worker process — not inside any interactive AI session. The AI (Claude Code, Codex, or a human) is the **operator**, layered on top via MCP, for proposing/inspecting/pausing strategies — never in the money-math path.
+### 1. Install and run the checks
 
-## Generic, not a demo
-
-Contribution amounts, tickers, schedules, and leverage are all user-supplied, with no hardcoded product minimum, no fixed demo amount, and no NVDA-specific code path — verified this session by grepping `src/` for hardcoded dollar figures/ticker special-casing (none found) and by `tests/contributionSizeSweep.test.ts` (10 tests sweeping $5 through $1,000,000) and `tests/fundingReadiness.test.ts`. The $34–$40 numbers that appear in `LIVE_TRADING_READINESS.md` are **one proposed human-approved test configuration**, not a product limit — see that document's own explicit statement to this effect.
-
-## Architecture
-
-```
-src/
-  engine/       deterministic sizing (90/10 split, 2x/3x leverage, exact BigInt fixed-point math) — no LLM, no network
-    decimal.ts  exact fixed-point arithmetic (avoids float rounding bugs in order sizing)
-  binance/
-    client.ts          public market-data discovery: validates a ticker's bStock + TradFi-perp pair against
-                        Binance's own classification fields, not naming patterns
-    execution.ts        ExecutionAdapter interface; PaperExecutionAdapter (always-on, real); getExecutionAdapter()
-                         constructs LiveExecutionAdapter only after the full live-trading gate passes
-    liveSigning.ts,
-    liveRequests.ts,
-    liveHttp.ts          HMAC signing, signed-request builders, a real (but only ever gate-reachable) HTTP
-                          transport, and order reconciliation — pure/testable, mock-tested, fail-closed
-    liveExecution.ts      the real live adapter: idempotent placement, ambiguous-outcome recovery (query before
-                           ever retrying), leverage/margin verification (reads back real account state, refuses
-                           to place an order if it doesn't match — see LIVE_TRADING_READINESS.md §9), preflight
-    fundingReadiness.ts    compares a proposed contribution's real sizing requirement against actual account
-                           balances — pure function, generic across ticker/amount
-  observations/  cross-checks operator-supplied Binance Agent OS observations against HedgeOS's own live
-                 discovery — evidence only, never a sizing input (src/observations/externalObservation.ts)
-  db/           SQLite schema + access (strategies, executions, receipts, cycles) — single-tenant today
-  scheduler/    cadence math + idempotent due-cycle lifecycle (pending -> in_progress -> completed/
-                failed_retryable/failed_terminal), crash recovery, optional end_at enforcement
-                (no cycle created past it, inclusive boundary, missed-cycle catch-up correctly capped)
-  worker/       runContribution.ts (observe -> decide -> act -> verify, one contribution) +
-                index.ts (the actual persistent process: reconciles on boot, ticks on an interval)
-  risk/         deterministic risk alerts (missing hedge exposure, stale schedule, reconciliation
-                discrepancy, static margin-headroom note) — never triggers automatic rebalancing
-  mcp/          HedgeOS's own MCP server — operator interface for Claude Code / Codex / any MCP client
-  dashboard/    minimal read-only Express dashboard (strategy, positions, risk alerts, cycle history)
-```
-
-## Running it
+Requirements: Git, a supported Node.js installation, npm, and internet access for Binance market data. For an always-on deployment, use a Linux VPS with SSH access. See [SELF_HOSTED_INSTALL.md](docs/SELF_HOSTED_INSTALL.md) for the complete server setup.
 
 ```bash
+git clone https://github.com/Benita2001/HedgeOS.git
+cd HedgeOS
 npm install
-npm test              # 214 tests
-npx tsc --noEmit       # typecheck
+npm test
+npx tsc --noEmit
 ```
 
-**One-off paper demo** (real live market data, simulated fill, no order placed):
+### 2. Run a one-off paper contribution
+
 ```bash
-npx tsx scripts/paper-demo.ts NVDA 100 2     # ticker, contribution $, leverage — any valid values work, this is just an example
+npx tsx scripts/paper-demo.ts NVDA 100 2
 ```
 
-**Persistent worker** (the actual autonomous service):
+The arguments are ticker, contribution amount, and leverage. They are example values, not product constants. This demonstration uses live market data and simulated execution; it requires no trading credentials and places no real orders.
+
+### 3. Start a persistent paper strategy
+
+For a local worker demonstration:
+
 ```bash
-npx tsx scripts/seed-strategy.ts AAPL 250 2 weekly   # create a strategy, due immediately for demo
-HEDGEOS_MODE=paper npx tsx src/worker/index.ts       # runs until Ctrl+C; restart-safe, won't double-execute
+npx tsx scripts/seed-strategy.ts AAPL 250 2 weekly
+HEDGEOS_MODE=paper npx tsx src/worker/index.ts
 ```
 
-**HedgeOS MCP server** — see `docs/OPERATOR_GUIDE.md` (both clients) and `docs/MCP_SETUP.md` (Claude Code detail):
-```bash
-claude mcp add hedgeos --transport stdio -- npx tsx src/mcp/server.ts
-```
+Keep the worker running in its own terminal. The seed command is a demonstration helper; for a configurable natural-language strategy, use the MCP workflow below. The database retains strategy and cycle state across process restarts.
 
-**Combined Binance Agent OS + HedgeOS MCP demo** (real Agent OS observations + real HedgeOS sizing + paper execution):
-```bash
-npx tsx scripts/agent-os-integration-demo.ts
-```
+For an independent VPS deployment, follow the install guide and use your own host:
 
-**Real read-only live-account preflight** (needs your own credentials, never through chat — see `docs/LIVE_PREFLIGHT_SETUP.md`):
-```bash
-npx tsx scripts/live-preflight.ts AAPL
-```
-
-**Dashboard** (read-only, labels PAPER MODE prominently):
-```bash
-HEDGEOS_MODE=paper npx tsx src/dashboard/server.ts   # http://localhost:8766
-```
-
-**Self-hosted deploy** (your own VPS, not the founder's):
 ```bash
 export HEDGEOS_DEPLOY_HOST=root@<your-host>
 ./deploy/deploy.sh
 ```
 
-## Product policy (frozen — see `PROJECT_PLAN.md`)
+The deploy tooling installs a dedicated service user, an independent Node runtime, systemd services, and SQLite backups. The dashboard binds to loopback by default. Do not copy the founder's database, private environment files, or credentials.
 
-- 90% of each contribution buys the stock/bStock; 10% is the hedge collateral budget.
-- The split is per contribution, never based on total account balance or portfolio NAV.
-- Hedge leverage: 2x default, 3x optional, nothing higher in P0. Never raised to force an order past the exchange minimum.
-- The hedge is an exact matching short TradFi perpetual — no proxy hedging, no substitute instrument, ever, without a separate explicit policy change.
-- Ordinary price movement never triggers routine hedge-ratio rebalancing. New contributions are the normal trigger for adding hedge exposure.
-- A hedge budget too small to clear the exchange minimum is deferred and accumulated — never dropped, never force-executed below the floor.
-- Paper fills are always explicitly labeled simulated. Real market data does not make a simulated fill live.
-- Isolated margin is not treated as a guaranteed maximum-loss cap (funding fees, liquidation fee, and gap risk are real) — a contribution budget is a capital budget, not a promised ceiling.
+### 4. Connect HedgeOS to Claude Code
 
-## Key design decisions worth knowing before reading the code
+From the repository directory, register the local stdio MCP server:
 
-1. **Sizing uses exact BigInt fixed-point arithmetic** (`src/engine/decimal.ts`), not native float math — a real rounding bug was caught and fixed during development. See `PROGRESS_LOG.md` checkpoint 1.
-2. **Instrument discovery validates identity, not naming convention.** The futures leg must carry Binance's own `underlyingType: EQUITY` + `underlyingSubType: ["TradFi"]` classification; the spot leg's `baseAsset` must exactly equal `<TICKER>B`; both are cross-checked against each other.
-3. **Idempotency is a database-level compare-and-swap.** `claimCycle()`'s `UPDATE ... WHERE status IN ('pending','failed_retryable')` only succeeds once per due slot, regardless of restarts, overlapping ticks, or a concurrent MCP-triggered manual run. Proven end-to-end, not just unit-tested.
-4. **A thrown error can never silently lose a real fill.** A genuine defect found and fixed this session: an exception from the hedge leg's placement used to propagate out of `runContribution` before the database write, meaning a real, exchange-confirmed stock fill could vanish with zero record. Fixed and regression-tested (`tests/runContribution.test.ts`).
-5. **Configuration is verified, not trusted.** Setting leverage/margin type gets read back and checked against the real account before an order is ever placed — found necessary this session when a real test account turned out to default to 20×/Cross on a never-before-configured symbol.
-6. **Live execution stays gated, not just "off by default."** Four independent conditions, checked separately, none set by anything in this repo — see `LIVE_TRADING_READINESS.md` §5.
+```bash
+claude mcp add hedgeos --transport stdio -- npx tsx src/mcp/server.ts
+```
 
-## What this is not
+Open Claude Code and use `/mcp` to confirm the connection. The MCP process must point to the same database as the worker. For remote operation, use the documented SSH-spawn pattern rather than exposing an unauthenticated public MCP port.
 
-Not a chatbot — the AI proposes and confirms, it doesn't compute money math. Not a guarantee of downside protection, a continuous 10% hedge ratio, or a maximum-loss cap. Not yet a *complete hedged* live cycle — one real stock order has filled (see "Live proof"), but no matching hedge order has ever been placed; the account currently holds a real, unhedged position. Not multi-tenant.
+Codex setup is documented in [OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md); local and remote details are in [MCP_SETUP.md](docs/MCP_SETUP.md).
 
-## Documents
+### 5. Connect Binance Agent OS
 
-- `PROJECT_PLAN.md` — product policy, Phase 0 research findings, critical demo path
-- `EXECUTION_ROUTE_DECISION.md` — why the hedge leg uses direct REST rather than Agent OS MCP (which doesn't expose Futures order tools)
-- `LIVE_TRADING_READINESS.md` — exact prerequisites, verified API contracts, real preflight results, the proposed (not-yet-approved) minimal live-test budget
-- `PROGRESS_LOG.md` — full checkpoint-by-checkpoint evidence log
-- `docs/MCP_SETUP.md` — connecting the HedgeOS MCP server to Claude Code
-- `docs/OPERATOR_GUIDE.md` — reusable operator workflow for any MCP client, natural-language strategy proposals
-- `docs/AGENT_OS_OPERATOR_WORKFLOW.md` — how Binance Agent OS MCP and HedgeOS's own MCP work together
-- `docs/FUNDING_READINESS.md` — funding-readiness checks, future auto-transfer requirements
-- `docs/SELF_HOSTED_INSTALL.md` — generic install path for a second, independent user
-- `docs/MULTI_TENANT_ARCHITECTURE.md` — design sketch for future multi-user hosting (not implemented)
-- `docs/LIVE_PREFLIGHT_SETUP.md` — secure per-user credential onboarding
-- `docs/INTEGRATION_SURFACES.md` — the four distinct integration surfaces, and why they're kept separate
-- `docs/BINANCE_SKILLS_HUB_ASSESSMENT.md` — official Binance Skills Hub research: what was installed, inspected, and why nothing was wired into HedgeOS's own execution path
+Register Binance's official Agent OS MCP endpoint:
+
+```bash
+claude mcp add binance-mcp-server --transport http https://agent.binance.com/mcp/agentic
+```
+
+Complete the official authentication flow in your own client. The integration allows Claude to retrieve real Binance observations and pass them to HedgeOS for cross-checking.
+
+Agent OS authentication and the main-account REST execution credentials are separate; do not assume the Agentic sub-account's balances or permissions represent the execution account.
+
+### 6. Create a strategy through natural language
+
+Ask Claude:
+
+> Use HedgeOS to invest $100 in Nvidia every week for six months. Use paper mode and show me the proposal before creating it.
+
+The operator should retrieve current observations, call `preview_with_agent_os_observations` when Agent OS is available, and present the structured strategy, exchange minimums, allocation, schedule, and funding requirements. After confirmation, use `create_paper_strategy` and inspect the result with `get_strategy_status` and `list_receipts`.
+
+For a finite autonomous demonstration, choose a short interval and explicit end time. Close the AI client after a completed cycle, leave the worker running, and reconnect after the next due time to inspect the new receipt. This demonstrates the difference between a persistent agent and a chat-session script.
+
+### 7. Inspect the dashboard
+
+```bash
+HEDGEOS_MODE=paper npx tsx src/dashboard/server.ts
+```
+
+Open `http://localhost:8766`. For a remote VPS, use the SSH tunnel described in the deployment guide. The dashboard is read-only and is not a substitute for exchange-confirmed account state.
+
+## MCP operator tools
+
+The current source exposes these operator capabilities:
+
+| Purpose           | Tools                                                                                              |
+| ----------------- | -------------------------------------------------------------------------------------------------- |
+| Inspect           | `list_strategies`, `get_strategy_status`, `list_recent_cycles`, `list_executions`, `list_receipts` |
+| Preview           | `preview_strategy`, `preview_with_agent_os_observations`, `check_funding_readiness`                |
+| Paper operation   | `create_paper_strategy`, `trigger_due_cycle`                                                       |
+| Strategy controls | `pause_strategy`, `resume_strategy`                                                                |
+| Live operation    | `create_live_strategy`, `authorize_live_strategy`, `trigger_live_cycle`                            |
+
+`create_live_strategy` persists a draft; it does not itself place an order. `authorize_live_strategy` is a separate authorization for autonomous recurrence. `trigger_live_cycle` invokes the real execution adapter only when its independent runtime gate passes.
+
+**Mode selection:** Explicit paper requests must remain paper, and explicit real-money requests must be presented as live proposals. If intent is ambiguous, the operator should ask rather than silently create a paper or live strategy. An existing paper strategy is never silently converted into a live one.
+
+## Live trading and funding
+
+The live architecture includes authenticated Spot and USDⓈ-M Futures REST clients, leverage/margin configuration, actual-fill reconciliation, stable order identifiers, ambiguous-outcome recovery, capital limits, finite schedules, and separate automatic-funding controls.
+
+These components have been tested, but the verified real-money evidence is limited to the Spot transaction described above.
+
+Real-money use requires the operator's own eligible Binance account, supported instruments, sufficient funds, restricted API credentials, and explicit financial authorization. Start with [LIVE_PREFLIGHT_SETUP.md](docs/LIVE_PREFLIGHT_SETUP.md) and [LIVE_TRADING_READINESS.md](LIVE_TRADING_READINESS.md). Keep credentials in private, permission-restricted files; never paste them into chat or commit them to GitHub. Disable withdrawals and restrict API access to the intended host and required scopes.
+
+Automatic funding is a separate capability. It is designed to transfer only the planned Spot-to-USDⓈ-M collateral shortfall within explicit caps. The implementation includes durable reservations and transfer reconciliation, but **an actual automatic funding transfer has not yet been verified**.
+
+The old account-permission blocker was resolved in a later authenticated check; historical reports saying `permitsUniversalTransfer=false` are no longer the latest evidence. Permission changes, however, are not proof that a transfer has succeeded.
+
+Do not activate live mode by casually changing a single environment variable. The worker and MCP execution context must use a coherent release and the documented live/funding gates. For real-money recovery, inspect actual positions and reconcile uncertain outcomes before considering another order.
+
+The repository's historical, hardcoded controlled-cycle script is evidence of one authorized test, not a generic command that another user should run with their own funds.
+
+## Engineering decisions
+
+### Deterministic financial rules
+
+The sizing engine uses BigInt fixed-point arithmetic and live exchange filters. It never raises leverage or rounds an order up merely to satisfy a minimum. A small contribution can create a valid stock leg while leaving the hedge deferred; that means the exposure is temporarily unhedged and must be reported as such.
+
+### Persistence and idempotency
+
+SQLite stores strategies, cycles, executions, receipts, and funding reservations. Due-cycle claims use durable state to prevent overlapping worker ticks and MCP triggers from executing the same slot twice. The worker reconciles interrupted cycles on startup and preserves confirmed fills when later legs fail.
+
+### Funding isolation
+
+The funding planner distinguishes stock spend, hedge target notional, collateral, fees, wallet balances, and deferred budgets. Atomic SQLite reservations protect against HedgeOS's own concurrent strategies claiming the same funds. They cannot prevent a separate manual trade or another application from changing the exchange balance between observations.
+
+### Risk boundaries
+
+The hedge is a matching short perpetual, not a promise of capital protection. Ordinary price movement does not trigger continuous hedge-ratio restoration. Funding rates, basis divergence, liquidation, slippage, and incomplete execution remain real risks. Isolated margin and the 10% collateral budget do not guarantee that total losses are capped at the contribution amount.
+
+## Current scope and limitations
+
+HedgeOS is a working single-tenant agent and a developer-oriented trading system, not a finished multi-user investment service. It does not provide hosted signup, per-user account isolation, or a public authenticated MCP endpoint. A multi-tenant architecture is documented separately, not implemented.
+
+The principal remaining live-validation gaps are a completed exchange-confirmed Futures hedge, a real automatic funding transfer, and an independently verified unattended live recurring run. The current deferred-hedge recovery workflow also needs a dedicated operation that can complete an existing hedge without purchasing additional stock. These limitations are not hidden by the successful Spot proof.
+
+## Documentation and source map
+
+| Area                                      | Source                                                                         |
+| ----------------------------------------- | ------------------------------------------------------------------------------ |
+| Product policy                            | [PROJECT_PLAN.md](PROJECT_PLAN.md)                                             |
+| Full build and test history               | [PROGRESS_LOG.md](PROGRESS_LOG.md)                                             |
+| Live execution evidence and prerequisites | [LIVE_TRADING_READINESS.md](LIVE_TRADING_READINESS.md)                         |
+| Operator workflow                         | [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md)                               |
+| MCP setup                                 | [docs/MCP_SETUP.md](docs/MCP_SETUP.md)                                         |
+| Self-hosting                              | [docs/SELF_HOSTED_INSTALL.md](docs/SELF_HOSTED_INSTALL.md)                     |
+| Binance Agent OS integration              | [docs/AGENT_OS_OPERATOR_WORKFLOW.md](docs/AGENT_OS_OPERATOR_WORKFLOW.md)       |
+| Execution route rationale                 | [EXECUTION_ROUTE_DECISION.md](EXECUTION_ROUTE_DECISION.md)                     |
+| Funding architecture                      | [docs/FUNDING_READINESS.md](docs/FUNDING_READINESS.md)                         |
+| Official Skills assessment                | [docs/BINANCE_SKILLS_HUB_ASSESSMENT.md](docs/BINANCE_SKILLS_HUB_ASSESSMENT.md) |
+| Multi-tenant design sketch                | [docs/MULTI_TENANT_ARCHITECTURE.md](docs/MULTI_TENANT_ARCHITECTURE.md)         |
+
+The application source is organized under `src/engine`, `src/binance`, `src/observations`, `src/db`, `src/scheduler`, `src/worker`, `src/mcp`, `src/risk`, and `src/dashboard`. The repository includes tests and self-hosted deployment tooling. No credentials, live account access, or founder-hosted service are required to reproduce the paper demonstration.
+
+---
+
+HedgeOS is open source for inspection and self-hosted experimentation. Use real money only with an understanding of the risks and the applicable Binance product and jurisdiction requirements. Nothing in this repository guarantees investment returns, downside protection, or recovery of collateral.
