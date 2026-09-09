@@ -2,6 +2,8 @@
 
 **Autonomous stock accumulation with a corresponding hedge, operated through Claude Code or Codex.**
 
+<img width="848" height="326" alt="image" src="https://github.com/user-attachments/assets/dd78cc8d-a3b8-464b-9082-73ff65d43607" />
+
 Built for the Binance Agent OS Mini Hackathon · Track A — Agent Creation
 
 HedgeOS turns a natural-language investment instruction into a persistent, exchange-aware strategy. Instead of manually repeating stock purchases, calculating a Futures hedge, and keeping a trading terminal open, users can configure a strategy once and let a dedicated worker manage the schedule, execution, and records.
